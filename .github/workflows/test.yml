@@ -1,4 +1,4 @@
-name: Test AiSensy Dashboard
+name: Test AiSensy Login
 
 on:
   workflow_dispatch:
@@ -18,12 +18,19 @@ jobs:
           pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: Test AiSensy Dashboard
+      - name: Test AiSensy Login
+        env:
+          AISENSY_EMAIL: ${{ secrets.AISENSY_EMAIL }}
+          AISENSY_PASSWORD: ${{ secrets.AISENSY_PASSWORD }}
         run: |
           python - <<'PY'
+          import os
           from playwright.sync_api import sync_playwright
 
-          url = (
+          username = os.environ["AISENSY_EMAIL"]
+          password = os.environ["AISENSY_PASSWORD"]
+
+          dashboard_url = (
               "https://www.app.aisensy.com/projects/"
               "6589906ef69fc70b424e0e43/dashboard"
           )
@@ -33,30 +40,46 @@ jobs:
               page = browser.new_page()
 
               try:
-                  print("Opening AiSensy dashboard...")
+                  print("Opening AiSensy login page...")
 
-                  response = page.goto(
-                      url,
+                  page.goto(
+                      "https://www.app.aisensy.com/login",
                       wait_until="domcontentloaded",
                       timeout=60000
                   )
 
-                  page.wait_for_timeout(10000)
+                  page.locator(
+                      'input[type="text"], input[type="email"]'
+                  ).first.fill(username)
 
-                  print("HTTP status:",
-                        response.status if response else "Unknown")
+                  page.locator(
+                      'input[type="password"]'
+                  ).fill(password)
 
-                  print("Final URL:", page.url)
+                  page.get_by_text(
+                      "Continue",
+                      exact=True
+                  ).click()
+
+                  page.wait_for_timeout(8000)
+
+                  print("Checking login status...")
+
+                  page.goto(
+                      dashboard_url,
+                      wait_until="domcontentloaded",
+                      timeout=60000
+                  )
+
+                  page.wait_for_timeout(5000)
+
+                  if "/login" in page.url:
+                      raise RuntimeError(
+                          "Login unsuccessful or additional verification required."
+                      )
+
+                  print("SUCCESS: AiSensy dashboard reached!")
                   print("Page title:", page.title())
-
-                  print("Visible page text:")
-                  print(page.locator("body").inner_text()[:1000])
-
-                  print("Dashboard access test completed.")
-
-              except Exception as e:
-                  print("ERROR:", str(e))
-                  raise
 
               finally:
                   browser.close()
