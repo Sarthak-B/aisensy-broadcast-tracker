@@ -15,7 +15,7 @@ concurrency:
 jobs:
   export:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     steps:
       - name: Set up Python
@@ -39,6 +39,7 @@ jobs:
           import json
           import os
           import re
+          import time
           from datetime import datetime, timezone
 
           from google.oauth2 import service_account
@@ -48,22 +49,42 @@ jobs:
           PROJECT_ID = "6589906ef69fc70b424e0e43"
           BASE = f"https://www.app.aisensy.com/projects/{PROJECT_ID}"
           LIST_URL = BASE + "/campaigns/all"
-          SHEET = "Broadcast_Data"
+          SHEET_NAME = "Broadcast_Data"
 
           MAX_CAMPAIGNS = 50
           MAX_PAGES = 5
 
+          CAMPAIGN_PATTERN = re.compile(
+              r"(?m)^([^\n]+)\n"
+              r"BROADCAST\n\n?"
+              r"([A-Za-z]{3} \d{1,2}, \d{4}, "
+              r"\d{1,2}:\d{2} [AP]M)"
+          )
+
+          def lines_from_page(page):
+              return [
+                  line.strip()
+                  for line in page.locator("body").inner_text().splitlines()
+                  if line.strip()
+              ]
+
+          def field_after(lines, label):
+              for index, line in enumerate(lines[:-1]):
+                  if line.lower() == label.lower():
+                      return lines[index + 1]
+              return ""
+
           def metric(lines, label):
               values = []
 
-              for i, line in enumerate(lines[:-1]):
-                  if line.lower() == label.lower():
-                      value = lines[i + 1]
+              for index, line in enumerate(lines[:-1]):
+                  if line.lower() != label.lower():
+                      continue
 
-                      if re.fullmatch(r"[\d,]+", value):
-                          values.append(
-                              int(value.replace(",", ""))
-                          )
+                  value = lines[index + 1]
+
+                  if re.fullmatch(r"[\d,]+", value):
+                      values.append(int(value.replace(",", "")))
 
               if not values:
                   raise ValueError(f"Missing metric: {label}")
@@ -71,17 +92,19 @@ jobs:
               return values[-1]
 
           def actual_cost(lines):
-              for i, line in enumerate(lines[:-1]):
-                  if line == "Total Credit Usage":
-                      match = re.fullmatch(
-                          r"₹\s*([\d,]+(?:\.\d+)?)",
-                          lines[i + 1]
-                      )
+              for index, line in enumerate(lines[:-1]):
+                  if line != "Total Credit Usage":
+                      continue
 
-                      if match:
-                          return float(
-                              match.group(1).replace(",", "")
-                          )
+                  match = re.fullmatch(
+                      r"₹\s*([\d,]+(?:\.\d+)?)",
+                      lines[index + 1]
+                  )
+
+                  if match:
+                      return float(
+                          match.group(1).replace(",", "")
+                      )
 
               raise ValueError("Missing Total Credit Usage")
 
@@ -106,13 +129,6 @@ jobs:
 
               raise ValueError("Missing actual Failed count")
 
-          def field_after(lines, label):
-              for i, line in enumerate(lines[:-1]):
-                  if line.lower() == label.lower():
-                      return lines[i + 1]
-
-              return ""
-
           def campaign_date(lines):
               value = field_after(lines, "Created At")
 
@@ -120,41 +136,12 @@ jobs:
                   return ""
 
               try:
-                  parsed = datetime.strptime(
+                  return datetime.strptime(
                       value,
                       "%b %d, %Y, %I:%M %p"
-                  )
-                  return parsed.strftime("%Y-%m-%d")
+                  ).strftime("%Y-%m-%d")
               except ValueError:
                   return ""
-
-          def wait_for_list(page):
-              page.get_by_text(
-                  "Rows per page:",
-                  exact=False
-              ).first.wait_for(timeout=30000)
-
-              page.wait_for_timeout(1200)
-
-          def read_campaign_names(page):
-              body = page.locator("body").inner_text()
-
-              pattern = re.compile(
-                  r"(?m)^([^\n]+)\n"
-                  r"BROADCAST\n\n?"
-                  r"([A-Za-z]{3} \d{1,2}, \d{4}, "
-                  r"\d{1,2}:\d{2} [AP]M)"
-              )
-
-              names = []
-
-              for match in pattern.finditer(body):
-                  name = match.group(1).strip()
-
-                  if name and name not in names:
-                      names.append(name)
-
-              return names
 
           def page_indicator(page):
               text = page.locator("body").inner_text()
@@ -164,10 +151,68 @@ jobs:
                   text
               )
 
-              return match.group(0) if match else ""
+              if not match:
+                  return ""
 
-          def advance_page(page, previous_indicator):
-              result = page.evaluate(
+              return match.group(0)
+
+          def read_campaign_names(page):
+              text = page.locator("body").inner_text()
+              names = []
+
+              for match in CAMPAIGN_PATTERN.finditer(text):
+                  name = match.group(1).strip()
+
+                  if name and name not in names:
+                      names.append(name)
+
+              return names
+
+          def wait_for_campaign_names(page, timeout=20000):
+              deadline = time.monotonic() + timeout / 1000
+
+              while time.monotonic() < deadline:
+                  names = read_campaign_names(page)
+
+                  if names:
+                      return names
+
+                  page.wait_for_timeout(500)
+
+              return []
+
+          def wait_for_list(page):
+              page.get_by_text(
+                  "Rows per page:",
+                  exact=False
+              ).first.wait_for(timeout=30000)
+
+              names = wait_for_campaign_names(page)
+
+              if not names:
+                  raise RuntimeError(
+                      "Campaign list loaded but no "
+                      "broadcast names appeared."
+                  )
+
+              return names
+
+          def go_to_list(page):
+              page.goto(
+                  LIST_URL,
+                  wait_until="domcontentloaded",
+                  timeout=60000
+              )
+
+              return wait_for_list(page)
+
+          def click_next_page(page):
+              previous = page_indicator(page)
+
+              if not previous:
+                  return False
+
+              clicked = page.evaluate(
                   """() => {
                     const elements =
                       [...document.querySelectorAll("*")];
@@ -212,7 +257,7 @@ jobs:
                   }"""
               )
 
-              if not result:
+              if not clicked:
                   return False
 
               try:
@@ -228,41 +273,46 @@ jobs:
                         return match &&
                           match[0] !== previous;
                       }""",
-                      arg=previous_indicator,
-                      timeout=12000
+                      arg=previous,
+                      timeout=15000
                   )
-
-                  return True
-
               except Exception:
+                  print(
+                      "Pagination indicator did not change."
+                  )
                   return False
 
-          def discover_campaign_names(page):
-              page.goto(
-                  LIST_URL,
-                  wait_until="domcontentloaded",
-                  timeout=60000
-              )
+              return True
 
-              wait_for_list(page)
+          def discover_campaign_names(page):
+              go_to_list(page)
 
               all_names = []
 
               for page_number in range(1, MAX_PAGES + 1):
                   indicator = page_indicator(page)
-                  names = read_campaign_names(page)
+
+                  # Important: pagination can update before
+                  # AiSensy's campaign cards finish rendering.
+                  names = wait_for_campaign_names(
+                      page,
+                      timeout=20000
+                  )
 
                   print(
                       f"Page {page_number}: "
                       f"{indicator or 'unknown range'}, "
-                      f"{len(names)} broadcasts"
+                      f"{len(names)} broadcasts",
+                      flush=True
                   )
 
                   if not names:
-                      raise RuntimeError(
-                          f"No broadcast names found "
-                          f"on page {page_number}"
+                      print(
+                          "No campaign names found on this "
+                          "page. Keeping earlier results.",
+                          flush=True
                       )
+                      break
 
                   for name in names:
                       if name not in all_names:
@@ -274,44 +324,43 @@ jobs:
                   if page_number == MAX_PAGES:
                       break
 
-                  if not indicator:
+                  if not click_next_page(page):
                       print(
-                          "Pagination indicator not found. "
-                          "Stopping discovery safely."
-                      )
-                      break
-
-                  if not advance_page(page, indicator):
-                      print(
-                          "Could not advance to the next "
-                          "campaign page. Stopping discovery."
+                          "Could not advance pagination. "
+                          "Keeping discovered campaigns.",
+                          flush=True
                       )
                       break
 
               print(
                   f"Discovered {len(all_names)} "
-                  f"unique broadcast names"
+                  f"unique broadcast names",
+                  flush=True
               )
+
+              if not all_names:
+                  raise RuntimeError(
+                      "No broadcast campaigns discovered."
+                  )
 
               return all_names[:MAX_CAMPAIGNS]
 
           def open_campaign(page, name):
-              page.goto(
-                  LIST_URL,
-                  wait_until="domcontentloaded",
-                  timeout=60000
-              )
-
-              wait_for_list(page)
+              go_to_list(page)
 
               for page_number in range(1, MAX_PAGES + 1):
-                  matches = page.get_by_text(
-                      name,
-                      exact=True
+                  names = wait_for_campaign_names(
+                      page,
+                      timeout=20000
                   )
 
-                  if matches.count():
-                      matches.first.click(timeout=15000)
+                  if name in names:
+                      target = page.get_by_text(
+                          name,
+                          exact=True
+                      ).first
+
+                      target.click(timeout=15000)
 
                       page.wait_for_url(
                           re.compile(
@@ -322,16 +371,14 @@ jobs:
 
                       return page.url
 
-                  indicator = page_indicator(page)
-
-                  if not indicator:
+                  if page_number == MAX_PAGES:
                       break
 
-                  if not advance_page(page, indicator):
+                  if not click_next_page(page):
                       break
 
               raise ValueError(
-                  f"Could not open campaign: {name}"
+                  f"Could not find campaign: {name}"
               )
 
           def extract_campaign(page, url, name):
@@ -346,7 +393,7 @@ jobs:
                   exact=True
               ).first.wait_for(timeout=30000)
 
-              page.wait_for_timeout(1200)
+              page.wait_for_timeout(1000)
 
               text = page.locator("body").inner_text()
 
@@ -395,9 +442,10 @@ jobs:
                   "delivered": delivered,
                   "read": read,
                   "failed": failed,
-                  "cost": cost,
+                  "cost": cost
               }
 
+          # Load AiSensy session securely from GitHub.
           state = json.loads(
               os.environ["AISENSY_SESSION"]
           )
@@ -421,7 +469,8 @@ jobs:
               for index, name in enumerate(names, start=1):
                   print(
                       f"[{index}/{len(names)}] "
-                      f"Processing {name}"
+                      f"Processing {name}",
+                      flush=True
                   )
 
                   try:
@@ -442,7 +491,8 @@ jobs:
                               f"delivered={data['delivered']}, "
                               f"read={data['read']}, "
                               f"failed={data['failed']}, "
-                              f"cost=INR {data['cost']}"
+                              f"cost=INR {data['cost']}",
+                              flush=True
                           )
 
                   except Exception as error:
@@ -451,7 +501,8 @@ jobs:
                       print(
                           f"Skipped {name}: "
                           f"{type(error).__name__}: "
-                          f"{str(error)[:180]}"
+                          f"{str(error)[:180]}",
+                          flush=True
                       )
 
               browser.close()
@@ -462,6 +513,7 @@ jobs:
                   "Google Sheets was not modified."
               )
 
+          # Connect to Google Sheets.
           credentials = (
               service_account.Credentials
               .from_service_account_info(
@@ -491,7 +543,7 @@ jobs:
 
           response = sheets.values().get(
               spreadsheetId=spreadsheet_id,
-              range=f"'{SHEET}'!A2:A"
+              range=f"'{SHEET_NAME}'!A2:A"
           ).execute()
 
           existing = response.get("values", [])
@@ -526,7 +578,9 @@ jobs:
 
               updates.extend([
                   {
-                      "range": f"'{SHEET}'!A{row}:I{row}",
+                      "range": (
+                          f"'{SHEET_NAME}'!A{row}:I{row}"
+                      ),
                       "values": [[
                           campaign["id"],
                           campaign["name"],
@@ -540,14 +594,18 @@ jobs:
                       ]]
                   },
                   {
-                      "range": f"'{SHEET}'!J{row}:K{row}",
+                      "range": (
+                          f"'{SHEET_NAME}'!J{row}:K{row}"
+                      ),
                       "values": [[
                           f"=IFERROR(G{row}/F{row},0)",
                           f"=IFERROR(H{row}/G{row},0)"
                       ]]
                   },
                   {
-                      "range": f"'{SHEET}'!M{row}:O{row}",
+                      "range": (
+                          f"'{SHEET_NAME}'!M{row}:O{row}"
+                      ),
                       "values": [[
                           (
                               f'=IF(OR(G{row}="",'
@@ -562,7 +620,8 @@ jobs:
 
               print(
                   f"{action}: {campaign['name']} "
-                  f"-> row {row}"
+                  f"-> row {row}",
+                  flush=True
               )
 
           sheets.values().batchUpdate(
@@ -576,12 +635,14 @@ jobs:
           print(
               f"SUCCESS: Updated "
               f"{len(campaigns)} broadcasts "
-              f"in Google Sheets"
+              f"in Google Sheets",
+              flush=True
           )
 
           if errors:
               print(
                   f"WARNING: {len(errors)} "
-                  f"campaign(s) were skipped."
+                  f"campaign(s) were skipped.",
+                  flush=True
               )
           PY
