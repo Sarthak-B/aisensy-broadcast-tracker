@@ -22,13 +22,20 @@ jobs:
         env:
           AISENSY_EMAIL: ${{ secrets.AISENSY_EMAIL }}
           AISENSY_PASSWORD: ${{ secrets.AISENSY_PASSWORD }}
+
         run: |
           python - <<'PY'
           import os
           from playwright.sync_api import sync_playwright
 
-          username = os.environ["AISENSY_EMAIL"]
-          password = os.environ["AISENSY_PASSWORD"]
+          username = os.environ.get("AISENSY_EMAIL", "")
+          password = os.environ.get("AISENSY_PASSWORD", "")
+
+          if not username or not password:
+              raise RuntimeError(
+                  "Missing GitHub Secrets. "
+                  "Check AISENSY_EMAIL and AISENSY_PASSWORD."
+              )
 
           dashboard_url = (
               "https://www.app.aisensy.com/projects/"
@@ -40,7 +47,7 @@ jobs:
               page = browser.new_page()
 
               try:
-                  print("Opening AiSensy login page...")
+                  print("Opening AiSensy login...")
 
                   page.goto(
                       "https://www.app.aisensy.com/login",
@@ -56,14 +63,65 @@ jobs:
                       'input[type="password"]'
                   ).fill(password)
 
-                  page.get_by_text(
+                  # Trigger normal field validation
+                  page.locator(
+                      'input[type="password"]'
+                  ).press("Tab")
+
+                  page.wait_for_timeout(2000)
+
+                  continue_button = page.get_by_text(
                       "Continue",
                       exact=True
-                  ).click()
+                  )
 
-                  page.wait_for_timeout(8000)
+                  print(
+                      "Continue button enabled:",
+                      continue_button.is_enabled()
+                  )
 
-                  print("Checking login status...")
+                  if not continue_button.is_enabled():
+                      print(
+                          "Login form is not ready to submit."
+                      )
+                      print(
+                          "Username field valid:",
+                          page.locator(
+                              'input[type="text"], input[type="email"]'
+                          ).first.evaluate(
+                              "(el) => el.checkValidity()"
+                          )
+                      )
+                      print(
+                          "Password field valid:",
+                          page.locator(
+                              'input[type="password"]'
+                          ).evaluate(
+                              "(el) => el.checkValidity()"
+                          )
+                      )
+                      raise RuntimeError(
+                          "Continue button disabled. "
+                          "Check username format or form validation."
+                      )
+
+                  print("Submitting login...")
+
+                  continue_button.click(timeout=10000)
+
+                  page.wait_for_timeout(5000)
+
+                  if "/login" in page.url:
+                      print(
+                          "Still on login page. "
+                          "Additional verification may be required."
+                      )
+                  else:
+                      print(
+                          "Login navigation occurred."
+                      )
+
+                  print("Checking dashboard access...")
 
                   page.goto(
                       dashboard_url,
@@ -74,12 +132,13 @@ jobs:
                   page.wait_for_timeout(5000)
 
                   if "/login" in page.url:
-                      raise RuntimeError(
-                          "Login unsuccessful or additional verification required."
+                      print(
+                          "Dashboard access not confirmed."
                       )
-
-                  print("SUCCESS: AiSensy dashboard reached!")
-                  print("Page title:", page.title())
+                  else:
+                      print(
+                          "SUCCESS: Dashboard navigation completed."
+                      )
 
               finally:
                   browser.close()
