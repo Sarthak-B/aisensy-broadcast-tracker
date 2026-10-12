@@ -34,7 +34,8 @@ jobs:
           if not username or not password:
               raise RuntimeError(
                   "Missing GitHub Secrets. "
-                  "Check AISENSY_EMAIL and AISENSY_PASSWORD."
+                  "Add AISENSY_EMAIL and AISENSY_PASSWORD "
+                  "under Settings > Secrets and variables > Actions."
               )
 
           dashboard_url = (
@@ -47,7 +48,7 @@ jobs:
               page = browser.new_page()
 
               try:
-                  print("Opening AiSensy login...")
+                  print("Opening AiSensy login page...")
 
                   page.goto(
                       "https://www.app.aisensy.com/login",
@@ -55,18 +56,18 @@ jobs:
                       timeout=60000
                   )
 
-                  page.locator(
+                  username_field = page.locator(
                       'input[type="text"], input[type="email"]'
-                  ).first.fill(username)
+                  ).first
 
-                  page.locator(
+                  password_field = page.locator(
                       'input[type="password"]'
-                  ).fill(password)
+                  )
 
-                  # Trigger normal field validation
-                  page.locator(
-                      'input[type="password"]'
-                  ).press("Tab")
+                  username_field.fill(username)
+                  password_field.fill(password)
+
+                  password_field.press("Tab")
 
                   page.wait_for_timeout(2000)
 
@@ -75,51 +76,44 @@ jobs:
                       exact=True
                   )
 
-                  print(
-                      "Continue button enabled:",
-                      continue_button.is_enabled()
-                  )
+                  button_enabled = continue_button.is_enabled()
 
-                  if not continue_button.is_enabled():
-                      print(
-                          "Login form is not ready to submit."
-                      )
+                  print("Continue button enabled:", button_enabled)
+
+                  if not button_enabled:
                       print(
                           "Username field valid:",
-                          page.locator(
-                              'input[type="text"], input[type="email"]'
-                          ).first.evaluate(
+                          username_field.evaluate(
                               "(el) => el.checkValidity()"
                           )
                       )
+
                       print(
                           "Password field valid:",
-                          page.locator(
-                              'input[type="password"]'
-                          ).evaluate(
+                          password_field.evaluate(
                               "(el) => el.checkValidity()"
                           )
                       )
+
                       raise RuntimeError(
                           "Continue button disabled. "
-                          "Check username format or form validation."
+                          "Check login identifier format and validation."
                       )
 
                   print("Submitting login...")
 
                   continue_button.click(timeout=10000)
 
-                  page.wait_for_timeout(5000)
+                  page.wait_for_timeout(6000)
 
-                  if "/login" in page.url:
-                      print(
-                          "Still on login page. "
-                          "Additional verification may be required."
-                      )
-                  else:
-                      print(
-                          "Login navigation occurred."
-                      )
+                  print("Checking authentication status...")
+
+                  # Do not print the full URL because
+                  # authentication redirects may contain tokens.
+                  print(
+                      "Still on login page:",
+                      "/login" in page.url
+                  )
 
                   print("Checking dashboard access...")
 
@@ -132,13 +126,20 @@ jobs:
                   page.wait_for_timeout(5000)
 
                   if "/login" in page.url:
-                      print(
+                      raise RuntimeError(
+                          "Dashboard authentication not confirmed. "
+                          "Login may require OTP or other verification."
+                      )
+
+                  if "/dashboard" not in page.url:
+                      raise RuntimeError(
+                          "Unexpected navigation after login. "
                           "Dashboard access not confirmed."
                       )
-                  else:
-                      print(
-                          "SUCCESS: Dashboard navigation completed."
-                      )
+
+                  print(
+                      "SUCCESS: AiSensy dashboard navigation completed!"
+                  )
 
               finally:
                   browser.close()
