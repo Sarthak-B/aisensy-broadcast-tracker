@@ -1,4 +1,4 @@
-name: Test AiSensy Campaign Data
+name: Test AiSensy Campaign Analytics
 
 on:
   workflow_dispatch:
@@ -18,7 +18,7 @@ jobs:
           pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: Check AiSensy Dashboard Content
+      - name: Inspect AiSensy Campaigns
         env:
           AISENSY_SESSION: ${{ secrets.AISENSY_SESSION }}
         run: |
@@ -45,20 +45,46 @@ jobs:
                   timeout=60000
               )
 
-              page.wait_for_timeout(10000)
+              page.wait_for_timeout(5000)
 
               if "/login" in page.url:
-                  raise RuntimeError("Session expired or login required.")
+                  raise RuntimeError(
+                      "Session expired. Please refresh AISENSY_SESSION."
+                  )
 
-              print("Dashboard URL reached.")
+              print("Authenticated dashboard loaded.")
 
-              # Print a short preview of visible page text.
-              # Avoid printing authentication data or page HTML.
-              text = page.locator("body").inner_text(timeout=15000)
-              preview = text[:2000]
+              # Find the Campaigns navigation item
+              campaigns = page.get_by_text(
+                  "Campaigns",
+                  exact=True
+              )
 
-              print("Dashboard text preview:")
-              print(preview)
+              print("Campaigns matches:", campaigns.count())
+
+              if campaigns.count() == 0:
+                  raise RuntimeError(
+                      "Campaigns navigation item not found."
+                  )
+
+              # Click Campaigns
+              campaigns.first.click(timeout=15000)
+
+              page.wait_for_timeout(8000)
+
+              print("Campaigns page URL:", page.url)
+
+              # Print visible campaign-related text
+              body = page.locator("body").inner_text(
+                  timeout=15000
+              )
+
+              print("\n--- CAMPAIGNS PAGE PREVIEW ---")
+
+              # Avoid dumping the entire page into logs.
+              print(body[:3500])
+
+              print("--- END PREVIEW ---")
 
               browser.close()
           PY
