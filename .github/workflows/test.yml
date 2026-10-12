@@ -3,7 +3,7 @@ name: Sync AiSensy Broadcasts to Google Sheets
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */2 * * *'
+    - cron: '23 */2 * * *'  # Every 2 hours, offset from GitHub's busy minute 0
 
 permissions:
   contents: read
@@ -246,6 +246,10 @@ jobs:
                       print(f'WARNING: Skipped {name}: {exc}', flush=True)
               browser.close()
 
+          if not names:
+              raise RuntimeError('AiSensy campaign list returned no names. Session may have expired or the page changed; spreadsheet was not modified.')
+          if not fetched:
+              raise RuntimeError('AiSensy campaigns were listed but none could be fetched. Spreadsheet was not modified.')
           sync_time = ist_now()
           new_ids = {rec['Campaign ID'] for rec in fetched if rec['Campaign ID'] not in existing_by_id}
           # Always rebuild the three views to normalize older UTC timestamps and
@@ -353,6 +357,7 @@ jobs:
           previous_dashboard = len(dashboard_ws.get_all_values())
           ensure_rows(dashboard_ws, len(dashboard))
           dashboard_ws.batch_clear([f'A1:O{max(previous_dashboard, len(dashboard))}'])
+          dashboard[12][1] = ist_now()  # Actual dashboard write time in IST
           update_values(dashboard_ws, f'A1:I{len(dashboard)}', dashboard)
           dashboard_ws.format('B13', {'numberFormat': {'type': 'TEXT'}})
           dashboard_ws.format('B2:B7', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
@@ -364,4 +369,29 @@ jobs:
               dashboard_ws.format(f'I17:I{16+len(records)}', {'numberFormat': {'type': 'CURRENCY', 'pattern': '₹#,##0.00'}})
 
           print(f'Sync complete: {new_count} new, {updated_count} updated, {len(records)} total campaigns.', flush=True)
+          PY
+      - name: Record failed sync in Dashboard
+        if: ${{ failure() }}
+        continue-on-error: true
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          GOOGLE_SHEET_ID: ${{ vars.GOOGLE_SHEET_ID }}
+        run: |
+          python - <<'PY'
+          import json, os
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          import gspread
+          from google.oauth2.service_account import Credentials
+          raw = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '').strip() or os.environ.get('GOOGLE_CREDENTIALS', '').strip()
+          if not raw:
+              raise RuntimeError('No Google credentials to report failed sync')
+          creds = Credentials.from_service_account_info(json.loads(raw), scopes=['https://www.googleapis.com/auth/spreadsheets'])
+          sheet_id = os.environ.get('GOOGLE_SHEET_ID', '').strip() or '1jXnQPQngi-FbEBBHC0tvaOTXxmtE5_miv6Mq0rTbmLQ'
+          ws = gspread.authorize(creds).open_by_key(sheet_id).worksheet('Dashboard')
+          timestamp = datetime.now(ZoneInfo('Asia/Kolkata')).strftime('%Y-%m-%d %I:%M:%S %p IST')
+          # Do not overwrite Last Sync: it records the last successful sync.
+          ws.update(range_name='C14', values=[[f'FAILED check at {timestamp}; see GitHub Actions logs']], value_input_option='RAW')
+          print('Recorded failure status in Dashboard; last successful sync timestamp retained.')
           PY
