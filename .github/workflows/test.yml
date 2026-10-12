@@ -13,21 +13,25 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Playwright
+      - name: Install dependencies
         run: |
-          pip install playwright
+          pip install playwright google-auth google-api-python-client
           python -m playwright install --with-deps chromium
 
-      - name: Extract Campaign Analytics
+      - name: Extract analytics and update Google Sheets
         env:
           AISENSY_SESSION: ${{ secrets.AISENSY_SESSION }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SHEET_ID: ${{ vars.GOOGLE_SHEET_ID }}
         run: |
           python - <<'PY'
-          import csv
           import json
           import os
           import re
           from datetime import datetime, timezone
+
+          from google.oauth2 import service_account
+          from googleapiclient.discovery import build
           from playwright.sync_api import sync_playwright
 
           PROJECT_ID = "6589906ef69fc70b424e0e43"
@@ -39,79 +43,53 @@ jobs:
               f"{PROJECT_ID}/campaigns/all/view/{CAMPAIGN_ID}"
           )
 
-          session = os.environ.get("AISENSY_SESSION")
+          SHEET_NAME = "Broadcast_Data"
 
-          if not session:
-              raise RuntimeError(
-                  "Missing AISENSY_SESSION GitHub secret."
-              )
-
-          state = json.loads(session)
-
+          # Extract numbers from the campaign details.
           def extract_number(lines, label):
-              """
-              Find an exact metric label followed by its value.
-              Uses the last matching occurrence to avoid
-              percentage summary cards.
-              """
               matches = []
 
               for i, line in enumerate(lines[:-1]):
-                  if line.strip().lower() == label.lower():
-                      next_line = lines[i + 1].strip()
+                  if line.lower() == label.lower():
+                      value = lines[i + 1]
 
-                      if re.fullmatch(r"[\d,]+", next_line):
+                      if re.fullmatch(r"[\d,]+", value):
                           matches.append(
-                              int(next_line.replace(",", ""))
+                              int(value.replace(",", ""))
                           )
 
               if not matches:
-                  raise ValueError(
-                      f"Could not extract metric: {label}"
-                  )
+                  raise ValueError(f"Missing metric: {label}")
 
               return matches[-1]
 
           def extract_cost(lines):
-              costs = []
+              values = []
 
               for i, line in enumerate(lines[:-1]):
-                  if line.strip() == "Total Credit Usage":
-                      value = lines[i + 1].strip()
-
+                  if line == "Total Credit Usage":
                       match = re.fullmatch(
                           r"₹\s*([\d,]+(?:\.\d+)?)",
-                          value
+                          lines[i + 1]
                       )
 
                       if match:
-                          costs.append(
-                              float(
-                                  match.group(1).replace(",", "")
-                              )
+                          values.append(
+                              float(match.group(1).replace(",", ""))
                           )
 
-              if not costs:
-                  raise ValueError(
-                      "Could not extract Total Credit Usage"
-                  )
+              if not values:
+                  raise ValueError("Missing actual credit usage")
 
-              return costs[-1]
+              return values[-1]
+
+          # Step A: Read AiSensy campaign analytics.
+          state = json.loads(os.environ["AISENSY_SESSION"])
 
           with sync_playwright() as p:
               browser = p.chromium.launch(headless=True)
-
-              context = browser.new_context(
-                  storage_state=state,
-                  viewport={
-                      "width": 1440,
-                      "height": 900
-                  }
-              )
-
+              context = browser.new_context(storage_state=state)
               page = context.new_page()
-
-              print("Opening AiSensy campaign...")
 
               page.goto(
                   URL,
@@ -124,119 +102,136 @@ jobs:
                   exact=True
               ).first.wait_for(timeout=30000)
 
-              page.wait_for_timeout(5000)
-
-              if "/login" in page.url:
-                  raise RuntimeError(
-                      "AiSensy session expired."
-                  )
-
-              body = page.locator("body").inner_text(
-                  timeout=15000
-              )
+              page.wait_for_timeout(3000)
 
               lines = [
                   line.strip()
-                  for line in body.splitlines()
+                  for line in page.locator("body").inner_text().splitlines()
                   if line.strip()
               ]
 
-              audience = extract_number(
-                  lines, "Audience"
-              )
-
-              sent = extract_number(
-                  lines, "Sent"
-              )
-
-              delivered = extract_number(
-                  lines, "Delivered"
-              )
-
-              read = extract_number(
-                  lines, "Read"
-              )
-
-              clicked = extract_number(
-                  lines, "Clicked"
-              )
-
-              replied = extract_number(
-                  lines, "Replied"
-              )
-
+              audience = extract_number(lines, "Audience")
+              sent = extract_number(lines, "Sent")
+              delivered = extract_number(lines, "Delivered")
+              read = extract_number(lines, "Read")
               actual_cost = extract_cost(lines)
 
-              # Temporary calculation for this test campaign.
-              # The final automation should read AiSensy's
-              # actual failed metric directly.
+              # Temporary approximation for the test campaign.
+              # This is not a reliable failed metric for all campaigns.
               failed = audience - sent
-
-              if not (
-                  audience >= sent >= delivered >= 0
-              ):
-                  raise ValueError(
-                      "Campaign metrics failed validation."
-                  )
-
-              if actual_cost <= 0:
-                  raise ValueError(
-                      "Actual cost must be positive "
-                      "for this test campaign."
-                  )
-
-              print("\n--- EXTRACTED ANALYTICS ---")
-              print("Campaign:", CAMPAIGN_NAME)
-              print("Audience:", audience)
-              print("Sent:", sent)
-              print("Delivered:", delivered)
-              print("Read:", read)
-              print("Clicked:", clicked)
-              print("Replied:", replied)
-              print("Failed (calculated):", failed)
-              print("Actual Cost: INR", actual_cost)
-              print("---------------------------")
 
               browser.close()
 
-          row = {
-              "Campaign ID": CAMPAIGN_ID,
-              "Campaign Name": CAMPAIGN_NAME,
-              "Audience Size": audience,
-              "Sent": sent,
-              "Delivered": delivered,
-              "Read": read,
-              "Clicked": clicked,
-              "Replied": replied,
-              "Failed": failed,
-              "Actual Cost": actual_cost,
-              "Last Updated": datetime.now(
-                  timezone.utc
-              ).isoformat()
-          }
+          if not (audience >= sent >= delivered >= 0):
+              raise ValueError("Invalid campaign statistics")
 
-          filename = "aisensy_broadcast_data.csv"
+          if actual_cost <= 0:
+              raise ValueError("Unexpected zero actual cost")
 
-          with open(
-              filename,
-              "w",
-              newline="",
-              encoding="utf-8"
-          ) as file:
-              writer = csv.DictWriter(
-                  file,
-                  fieldnames=list(row.keys())
-              )
+          print(
+              f"Extracted {CAMPAIGN_NAME}: "
+              f"audience={audience}, sent={sent}, "
+              f"delivered={delivered}, read={read}, "
+              f"actual_cost=INR {actual_cost}"
+          )
 
-              writer.writeheader()
-              writer.writerow(row)
+          # Step B: Connect to Google Sheets.
+          credentials_info = json.loads(
+              os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+          )
 
-          print("\nCSV exported successfully!")
+          credentials = service_account.Credentials.from_service_account_info(
+              credentials_info,
+              scopes=[
+                  "https://www.googleapis.com/auth/spreadsheets"
+              ]
+          )
+
+          service = build(
+              "sheets",
+              "v4",
+              credentials=credentials,
+              cache_discovery=False
+          )
+
+          spreadsheet_id = os.environ["GOOGLE_SHEET_ID"]
+
+          sheets = service.spreadsheets()
+
+          # Read existing rows so we can update instead of duplicating.
+          response = sheets.values().get(
+              spreadsheetId=spreadsheet_id,
+              range="'Broadcast_Data'!A2:O"
+          ).execute()
+
+          existing_rows = response.get("values", [])
+
+          target_row = None
+
+          for index, existing in enumerate(existing_rows, start=2):
+              # Column A is Campaign Name in the existing template.
+              if existing and existing[0] == CAMPAIGN_NAME:
+                  target_row = index
+                  break
+
+          if target_row is None:
+              target_row = len(existing_rows) + 2
+
+          # Existing template columns:
+          # A Campaign Name
+          # B Campaign ID (or other existing metadata)
+          # C Date
+          # D Campaign Type
+          # E Audience Size
+          # F Sent
+          # G Delivered
+          # H Read
+          # I Failed
+          # J Delivery Rate (formula)
+          # K Read Rate (formula)
+          # L Cost per Message (existing formula/input)
+          # M Estimated Cost (formula)
+          # N Actual Cost
+          # O Last Updated
+
+          now = datetime.now(timezone.utc).isoformat()
+
+          updates = [
+              {
+                  "range": f"'{SHEET_NAME}'!A{target_row}",
+                  "values": [[CAMPAIGN_NAME]]
+              },
+              {
+                  "range": f"'{SHEET_NAME}'!B{target_row}",
+                  "values": [[CAMPAIGN_ID]]
+              },
+              {
+                  "range": f"'{SHEET_NAME}'!D{target_row}:I{target_row}",
+                  "values": [[
+                      "BROADCAST",
+                      audience,
+                      sent,
+                      delivered,
+                      read,
+                      failed
+                  ]]
+              },
+              {
+                  "range": f"'{SHEET_NAME}'!N{target_row}:O{target_row}",
+                  "values": [[actual_cost, now]]
+              }
+          ]
+
+          sheets.values().batchUpdate(
+              spreadsheetId=spreadsheet_id,
+              body={
+                  "valueInputOption": "USER_ENTERED",
+                  "data": updates
+              }
+          ).execute()
+
+          print(
+              f"Google Sheets updated successfully: "
+              f"{SHEET_NAME}, row {target_row}"
+          )
           PY
-
-      - name: Upload CSV Report
-        uses: actions/upload-artifact@v4
-        with:
-          name: aisensy-broadcast-report
-          path: aisensy_broadcast_data.csv
-          retention-days: 7
