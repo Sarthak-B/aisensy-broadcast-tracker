@@ -18,7 +18,7 @@ jobs:
           pip install playwright google-auth google-api-python-client
           python -m playwright install --with-deps chromium
 
-      - name: Extract analytics and update Google Sheets
+      - name: Update Google Sheets
         env:
           AISENSY_SESSION: ${{ secrets.AISENSY_SESSION }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
@@ -37,53 +37,42 @@ jobs:
           PROJECT_ID = "6589906ef69fc70b424e0e43"
           CAMPAIGN_ID = "6acc6b9be85c517b3c81b4b9"
           CAMPAIGN_NAME = "10amremi"
+          SHEET = "Broadcast_Data"
 
-          URL = (
+          url = (
               f"https://www.app.aisensy.com/projects/"
               f"{PROJECT_ID}/campaigns/all/view/{CAMPAIGN_ID}"
           )
 
-          SHEET_NAME = "Broadcast_Data"
-
-          # Extract numbers from the campaign details.
-          def extract_number(lines, label):
+          def metric(lines, label):
               matches = []
-
               for i, line in enumerate(lines[:-1]):
                   if line.lower() == label.lower():
                       value = lines[i + 1]
-
                       if re.fullmatch(r"[\d,]+", value):
                           matches.append(
                               int(value.replace(",", ""))
                           )
-
               if not matches:
                   raise ValueError(f"Missing metric: {label}")
-
               return matches[-1]
 
-          def extract_cost(lines):
-              values = []
-
+          def cost(lines):
+              matches = []
               for i, line in enumerate(lines[:-1]):
                   if line == "Total Credit Usage":
-                      match = re.fullmatch(
+                      found = re.fullmatch(
                           r"₹\s*([\d,]+(?:\.\d+)?)",
                           lines[i + 1]
                       )
-
-                      if match:
-                          values.append(
-                              float(match.group(1).replace(",", ""))
+                      if found:
+                          matches.append(
+                              float(found.group(1).replace(",", ""))
                           )
+              if not matches:
+                  raise ValueError("Missing actual cost")
+              return matches[-1]
 
-              if not values:
-                  raise ValueError("Missing actual credit usage")
-
-              return values[-1]
-
-          # Step A: Read AiSensy campaign analytics.
           state = json.loads(os.environ["AISENSY_SESSION"])
 
           with sync_playwright() as p:
@@ -91,17 +80,10 @@ jobs:
               context = browser.new_context(storage_state=state)
               page = context.new_page()
 
-              page.goto(
-                  URL,
-                  wait_until="domcontentloaded",
-                  timeout=60000
-              )
-
+              page.goto(url, wait_until="domcontentloaded", timeout=60000)
               page.get_by_text(
-                  "Total Credit Usage",
-                  exact=True
+                  "Total Credit Usage", exact=True
               ).first.wait_for(timeout=30000)
-
               page.wait_for_timeout(3000)
 
               lines = [
@@ -110,76 +92,55 @@ jobs:
                   if line.strip()
               ]
 
-              audience = extract_number(lines, "Audience")
-              sent = extract_number(lines, "Sent")
-              delivered = extract_number(lines, "Delivered")
-              read = extract_number(lines, "Read")
-              actual_cost = extract_cost(lines)
+              audience = metric(lines, "Audience")
+              sent = metric(lines, "Sent")
+              delivered = metric(lines, "Delivered")
+              read = metric(lines, "Read")
+              actual_cost = cost(lines)
 
-              # Temporary approximation for the test campaign.
-              # This is not a reliable failed metric for all campaigns.
+              # Temporary approximation for this one test campaign.
               failed = audience - sent
-
               browser.close()
 
           if not (audience >= sent >= delivered >= 0):
               raise ValueError("Invalid campaign statistics")
 
           if actual_cost <= 0:
-              raise ValueError("Unexpected zero actual cost")
-
-          print(
-              f"Extracted {CAMPAIGN_NAME}: "
-              f"audience={audience}, sent={sent}, "
-              f"delivered={delivered}, read={read}, "
-              f"actual_cost=INR {actual_cost}"
-          )
-
-          # Step B: Connect to Google Sheets.
-          credentials_info = json.loads(
-              os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
-          )
+              raise ValueError("Unexpected actual cost")
 
           credentials = service_account.Credentials.from_service_account_info(
-              credentials_info,
-              scopes=[
-                  "https://www.googleapis.com/auth/spreadsheets"
-              ]
+              json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]),
+              scopes=["https://www.googleapis.com/auth/spreadsheets"]
           )
 
           service = build(
-              "sheets",
-              "v4",
+              "sheets", "v4",
               credentials=credentials,
               cache_discovery=False
           )
 
           spreadsheet_id = os.environ["GOOGLE_SHEET_ID"]
-
           sheets = service.spreadsheets()
 
-          # Read existing rows so we can update instead of duplicating.
           response = sheets.values().get(
               spreadsheetId=spreadsheet_id,
-              range="'Broadcast_Data'!A2:O"
+              range=f"'{SHEET}'!A2:B"
           ).execute()
 
-          existing_rows = response.get("values", [])
-
+          existing = response.get("values", [])
           target_row = None
 
-          for index, existing in enumerate(existing_rows, start=2):
-              # Column A is Campaign Name in the existing template.
-              if existing and existing[0] == CAMPAIGN_NAME:
+          for index, row in enumerate(existing, start=2):
+              if row and row[0] == CAMPAIGN_ID:
                   target_row = index
                   break
 
           if target_row is None:
-              target_row = len(existing_rows) + 2
+              target_row = len(existing) + 2
 
-          # Existing template columns:
-          # A Campaign Name
-          # B Campaign ID (or other existing metadata)
+          # Correct column order:
+          # A Campaign ID
+          # B Campaign Name
           # C Date
           # D Campaign Type
           # E Audience Size
@@ -187,10 +148,10 @@ jobs:
           # G Delivered
           # H Read
           # I Failed
-          # J Delivery Rate (formula)
-          # K Read Rate (formula)
-          # L Cost per Message (existing formula/input)
-          # M Estimated Cost (formula)
+          # J Delivery Rate
+          # K Read Rate
+          # L Cost per Message
+          # M Estimated Cost
           # N Actual Cost
           # O Last Updated
 
@@ -198,27 +159,29 @@ jobs:
 
           updates = [
               {
-                  "range": f"'{SHEET_NAME}'!A{target_row}",
-                  "values": [[CAMPAIGN_NAME]]
+                  "range": f"'{SHEET}'!A{target_row}:B{target_row}",
+                  "values": [[CAMPAIGN_ID, CAMPAIGN_NAME]]
               },
               {
-                  "range": f"'{SHEET_NAME}'!B{target_row}",
-                  "values": [[CAMPAIGN_ID]]
-              },
-              {
-                  "range": f"'{SHEET_NAME}'!D{target_row}:I{target_row}",
+                  "range": f"'{SHEET}'!D{target_row}:K{target_row}",
                   "values": [[
                       "BROADCAST",
                       audience,
                       sent,
                       delivered,
                       read,
-                      failed
+                      failed,
+                      f"=IFERROR(G{target_row}/F{target_row},0)",
+                      f"=IFERROR(H{target_row}/G{target_row},0)"
                   ]]
               },
               {
-                  "range": f"'{SHEET_NAME}'!N{target_row}:O{target_row}",
-                  "values": [[actual_cost, now]]
+                  "range": f"'{SHEET}'!M{target_row}:O{target_row}",
+                  "values": [[
+                      f'=IF(OR(G{target_row}="",L{target_row}=""),"",G{target_row}*L{target_row})',
+                      actual_cost,
+                      now
+                  ]]
               }
           ]
 
@@ -231,7 +194,8 @@ jobs:
           ).execute()
 
           print(
-              f"Google Sheets updated successfully: "
-              f"{SHEET_NAME}, row {target_row}"
+              f"Updated {SHEET} row {target_row}: "
+              f"sent={sent}, delivered={delivered}, "
+              f"read={read}, cost=INR {actual_cost}"
           )
           PY
