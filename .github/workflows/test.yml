@@ -9,7 +9,7 @@ jobs:
 
     steps:
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
@@ -18,15 +18,35 @@ jobs:
           pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: Test browser
+      - name: Test AiSensy Cloud Browser
         run: |
           python - <<'PY'
           from playwright.sync_api import sync_playwright
 
           with sync_playwright() as p:
               browser = p.chromium.launch(headless=True)
+
               page = browser.new_page()
-              page.goto("https://www.google.com")
-              print("Browser test successful!")
-              browser.close()
+
+              print("Starting AiSensy connection test...")
+
+              try:
+                  page.goto(
+                      "https://backend.aisensy.com",
+                      wait_until="domcontentloaded",
+                      timeout=60000
+                  )
+
+                  print("AiSensy page URL:", page.url)
+                  print("AiSensy page title:", page.title())
+
+                  print("SUCCESS: AiSensy website is accessible!")
+
+              except Exception as e:
+                  print("ERROR: Unable to access AiSensy.")
+                  print("Error details:", str(e))
+                  raise
+
+              finally:
+                  browser.close()
           PY
