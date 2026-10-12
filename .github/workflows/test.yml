@@ -1,4 +1,4 @@
-name: Test AiSensy Login
+name: Test AiSensy Saved Session
 
 on:
   workflow_dispatch:
@@ -11,144 +11,64 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install Playwright
         run: |
           pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: Test AiSensy Login
+      - name: Test AiSensy Session
         env:
-          AISENSY_EMAIL: ${{ secrets.AISENSY_EMAIL }}
-          AISENSY_PASSWORD: ${{ secrets.AISENSY_PASSWORD }}
-
+          AISENSY_SESSION: ${{ secrets.AISENSY_SESSION }}
         run: |
           python - <<'PY'
+          import json
           import os
           from playwright.sync_api import sync_playwright
 
-          username = os.environ.get("AISENSY_EMAIL", "")
-          password = os.environ.get("AISENSY_PASSWORD", "")
+          session = os.environ.get("AISENSY_SESSION")
 
-          if not username or not password:
-              raise RuntimeError(
-                  "Missing credentials. Add AISENSY_EMAIL and "
-                  "AISENSY_PASSWORD to GitHub Repository Secrets."
-              )
+          if not session:
+              raise RuntimeError("AISENSY_SESSION secret is missing.")
 
-          dashboard_url = (
+          state = json.loads(session)
+
+          dashboard = (
               "https://www.app.aisensy.com/projects/"
               "6589906ef69fc70b424e0e43/dashboard"
           )
 
           with sync_playwright() as p:
               browser = p.chromium.launch(headless=True)
-              page = browser.new_page()
+              context = browser.new_context(storage_state=state)
+              page = context.new_page()
 
-              try:
-                  print("Opening AiSensy login page...")
+              page.goto(
+                  dashboard,
+                  wait_until="domcontentloaded",
+                  timeout=60000
+              )
 
-                  page.goto(
-                      "https://www.app.aisensy.com/login",
-                      wait_until="domcontentloaded",
-                      timeout=60000
+              page.wait_for_timeout(10000)
+
+              if "/login" in page.url:
+                  raise RuntimeError(
+                      "Saved session rejected. AiSensy requires login."
                   )
 
-                  username_field = page.locator(
-                      'input[type="text"], input[type="email"]'
-                  ).first
-
-                  password_field = page.locator(
-                      'input[type="password"]'
-                  ).first
-
-                  username_field.fill(username)
-                  password_field.fill(password)
-
-                  password_field.press("Tab")
-
-                  page.wait_for_timeout(2000)
-
-                  continue_button = page.get_by_role(
-                      "button",
-                      name="Continue",
-                      exact=True
+              if page.locator('input[type="password"]').count() > 0:
+                  raise RuntimeError(
+                      "Login form is visible. Session not authenticated."
                   )
 
-                  print(
-                      "Continue button enabled:",
-                      continue_button.is_enabled()
+              if "/dashboard" not in page.url:
+                  raise RuntimeError(
+                      "Dashboard URL not reached."
                   )
 
-                  if not continue_button.is_enabled():
-                      print(
-                          "Username field valid:",
-                          username_field.evaluate(
-                              "(el) => el.checkValidity()"
-                          )
-                      )
+              print("SUCCESS: GitHub reached AiSensy dashboard URL.")
+              print("Authenticated dashboard data still needs verification.")
 
-                      print(
-                          "Password field valid:",
-                          password_field.evaluate(
-                              "(el) => el.checkValidity()"
-                          )
-                      )
-
-                      raise RuntimeError(
-                          "Continue button is disabled. "
-                          "Check login form validation."
-                      )
-
-                  print("Submitting login...")
-
-                  continue_button.click(timeout=10000)
-
-                  page.wait_for_timeout(6000)
-
-                  # Check for OTP without printing sensitive data
-                  otp_fields = page.locator(
-                      'input[autocomplete="one-time-code"], '
-                      'input[name*="otp" i], '
-                      'input[placeholder*="otp" i]'
-                  )
-
-                  if otp_fields.count() > 0:
-                      print(
-                          "OTP verification detected. "
-                          "Manual verification may be required."
-                      )
-                      raise RuntimeError(
-                          "Login requires OTP verification."
-                      )
-
-                  print("Checking dashboard access...")
-
-                  page.goto(
-                      dashboard_url,
-                      wait_until="domcontentloaded",
-                      timeout=60000
-                  )
-
-                  page.wait_for_timeout(5000)
-
-                  if "/login" in page.url:
-                      raise RuntimeError(
-                          "Dashboard requires authentication. "
-                          "Login may have failed or require verification."
-                      )
-
-                  if "/dashboard" not in page.url:
-                      raise RuntimeError(
-                          "Unexpected page after login. "
-                          "Dashboard access not confirmed."
-                      )
-
-                  print(
-                      "SUCCESS: AiSensy dashboard navigation completed!"
-                  )
-
-              finally:
-                  browser.close()
+              browser.close()
           PY
