@@ -150,8 +150,8 @@ jobs:
                   'Date': date_from_body(body),
                   'Campaign Type': kind.group(1) if kind else 'BROADCAST',
                   **values,
-                  'Cost per Message': 0.0,
-                  'Estimated Cost': 0.0,
+                  'Cost per Message': (values['Actual Cost'] / values['Sent']) if values['Sent'] else 0.0,
+                  'Estimated Cost': '',
                   'Last Updated': datetime.now(timezone.utc).isoformat(),
               }
               print(f"Fetched {name}: sent={record['Sent']}, delivered={record['Delivered']}, cost=INR {record['Actual Cost']}", flush=True)
@@ -169,12 +169,12 @@ jobs:
 
           def output_row(rec):
               sent, delivered, read = count(rec['Sent']), count(rec['Delivered']), count(rec['Read'])
-              rate = number(rec['Cost per Message'])
+              rate = number(rec['Actual Cost']) / sent if sent else 0.0
               return [
                   rec['Campaign ID'], rec['Campaign Name'], rec['Date'], rec['Campaign Type'],
                   count(rec['Audience Size']), sent, delivered, read, count(rec['Failed']),
                   delivered / sent if sent else 0, read / delivered if delivered else 0,
-                  rate, delivered * rate, number(rec['Actual Cost']), rec['Last Updated'],
+                  rate, '', number(rec['Actual Cost']), rec['Last Updated'],
               ]
 
           def ensure_rows(ws, minimum):
@@ -182,7 +182,7 @@ jobs:
                   ws.add_rows(minimum - ws.row_count)
 
           def update_values(ws, range_name, rows):
-              ws.update(range_name=range_name, values=rows, value_input_option='USER_ENTERED')
+              ws.update(range_name=range_name, values=rows, value_input_option='RAW')
 
           session_json = os.environ.get('AISENSY_SESSION', '').strip()
           google_json = (os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '').strip()
@@ -237,7 +237,6 @@ jobs:
                   old = existing_by_id[cid]
                   if not rec['Date']:
                       rec['Date'] = old.get('Date', '')
-                  rec['Cost per Message'] = number(old.get('Cost per Message', 0))
                   updated_count += 1
               else:
                   order.append(cid)
@@ -251,7 +250,10 @@ jobs:
           update_values(data_ws, f'A2:O{len(data_rows)+1}', data_rows)
           if len(existing_rows) > len(data_rows) + 1:
               data_ws.batch_clear([f'A{len(data_rows)+2}:O{len(existing_rows)}'])
+          data_ws.format(f'E2:I{len(data_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
           data_ws.format(f'J2:K{len(data_rows)+1}', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
+          data_ws.format(f'L2:L{len(data_rows)+1}', {'numberFormat': {'type': 'CURRENCY', 'pattern': '₹#,##0.000'}})
+          data_ws.format(f'N2:N{len(data_rows)+1}', {'numberFormat': {'type': 'CURRENCY', 'pattern': '₹#,##0.00'}})
 
           summary_header = [
               'Campaign ID', 'Campaign Name', 'Date', 'Audience', 'Sent', 'Delivered',
@@ -274,6 +276,7 @@ jobs:
           update_values(summary_ws, f'A1:L{len(summary_rows)+1}', [summary_header] + summary_rows)
           if previous_summary > len(summary_rows) + 1:
               summary_ws.batch_clear([f'A{len(summary_rows)+2}:L{previous_summary}'])
+          summary_ws.format(f'D2:H{len(summary_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
           summary_ws.format(f'I2:K{len(summary_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0.000'}})
 
           total_sent = sum(count(rec['Sent']) for rec in records)
@@ -281,7 +284,6 @@ jobs:
           total_read = sum(count(rec['Read']) for rec in records)
           total_failed = sum(count(rec['Failed']) for rec in records)
           total_cost = sum(number(rec['Actual Cost']) for rec in records)
-          total_estimated = sum(number(rec['Cost per Message']) * count(rec['Delivered']) for rec in records)
           dashboard = [
               ['Metric', 'Total'],
               ['Total Broadcasts', len(records)],
@@ -290,7 +292,7 @@ jobs:
               ['Total Messages Delivered', total_delivered],
               ['Total Messages Read', total_read],
               ['Total Messages Failed', total_failed],
-              ['Total Estimated Cost', total_estimated],
+              ['Total Estimated Cost', 'Not available from AiSensy'],
               ['Total Actual Cost', total_cost],
               ['Overall Delivery Rate', total_delivered / total_sent if total_sent else 0],
               ['Overall Read Rate', total_read / total_delivered if total_delivered else 0],
@@ -309,11 +311,13 @@ jobs:
               ])
           previous_dashboard = len(dashboard_ws.get_all_values())
           ensure_rows(dashboard_ws, len(dashboard))
-          dashboard_ws.batch_clear([f'A1:J{max(previous_dashboard, len(dashboard))}'])
+          dashboard_ws.batch_clear([f'A1:O{max(previous_dashboard, len(dashboard))}'])
           update_values(dashboard_ws, f'A1:I{len(dashboard)}', dashboard)
+          dashboard_ws.format('B2:B7', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
           dashboard_ws.format('B10:B11', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
           dashboard_ws.format('B8:B9', {'numberFormat': {'type': 'CURRENCY', 'pattern': '₹#,##0.00'}})
           if records:
+              dashboard_ws.format(f'C17:F{16+len(records)}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
               dashboard_ws.format(f'G17:H{16+len(records)}', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
               dashboard_ws.format(f'I17:I{16+len(records)}', {'numberFormat': {'type': 'CURRENCY', 'pattern': '₹#,##0.00'}})
 
