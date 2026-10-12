@@ -225,9 +225,21 @@ jobs:
                       print(f'WARNING: Skipped {name}: {exc}', flush=True)
               browser.close()
 
-          if not fetched:
-              print('No valid campaign analytics fetched; all three sheets remain unchanged.', flush=True)
+          sync_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+          new_ids = {rec['Campaign ID'] for rec in fetched if rec['Campaign ID'] not in existing_by_id}
+          if not new_ids:
+              # A scheduled check happened, but there is no new campaign to add.
+              # Keep all campaign metrics and summaries untouched.
+              status = ('No campaign data fetched; nothing was updated' if not fetched
+                        else 'No new campaigns; nothing was updated')
+              update_values(dashboard_ws, 'A13:B14', [
+                  ['Last Sync (UTC)', sync_time],
+                  ['Campaigns Added This Sync', 0],
+              ])
+              update_values(dashboard_ws, 'C14', [[status]])
+              print(f'Sync check complete: {status}. Dashboard sync time updated.', flush=True)
               raise SystemExit(0)
+          print(f'{len(new_ids)} new broadcast(s) found; refreshing the sheets.', flush=True)
 
           new_count = 0
           updated_count = 0
@@ -297,8 +309,8 @@ jobs:
               ['Overall Delivery Rate', total_delivered / total_sent if total_sent else 0],
               ['Overall Read Rate', total_read / total_delivered if total_delivered else 0],
               ['Average Cost per Sent Message', total_cost / total_sent if total_sent else 0],
-              ['Last Sync (UTC)', datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')],
-              [],
+              ['Last Sync (UTC)', sync_time],
+              ['Campaigns Added This Sync', new_count, f'{new_count} new campaign(s) added'],
               ['CAMPAIGN PERFORMANCE'],
               ['Campaign Name', 'Date', 'Sent', 'Delivered', 'Read', 'Failed', 'Delivery Rate', 'Read Rate', 'Actual Cost (INR)'],
           ]
