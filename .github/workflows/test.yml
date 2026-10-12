@@ -1,4 +1,4 @@
-name: Export AiSensy Broadcast Analytics
+name: AiSensy Latest 5 Broadcast Dashboard
 
 on:
   workflow_dispatch:
@@ -13,9 +13,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  export:
+  sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 20
 
     steps:
       - name: Set up Python
@@ -28,7 +28,7 @@ jobs:
           pip install playwright google-auth google-api-python-client
           python -m playwright install --with-deps chromium
 
-      - name: Sync AiSensy broadcasts to Google Sheets
+      - name: Fetch latest 5 and rebuild Google Sheets
         env:
           AISENSY_SESSION: ${{ secrets.AISENSY_SESSION }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
@@ -49,56 +49,52 @@ jobs:
           PROJECT_ID = "6589906ef69fc70b424e0e43"
           BASE = f"https://www.app.aisensy.com/projects/{PROJECT_ID}"
           LIST_URL = BASE + "/campaigns/all"
-          SHEET_NAME = "Broadcast_Data"
 
-          MAX_CAMPAIGNS = 50
-          MAX_PAGES = 5
+          DATA_TAB = "Broadcast_Data"
+          COST_TAB = "Cost Summary"
+          DASHBOARD_TAB = "Dashboard"
 
-          CAMPAIGN_PATTERN = re.compile(
-              r"(?m)^([^\n]+)\n"
-              r"BROADCAST\n\n?"
-              r"([A-Za-z]{3} \d{1,2}, \d{4}, "
-              r"\d{1,2}:\d{2} [AP]M)"
-          )
+          MAX_CAMPAIGNS = 5
 
-          def lines_from_page(page):
-              return [
-                  line.strip()
-                  for line in page.locator("body").inner_text().splitlines()
-                  if line.strip()
-              ]
+          # ---------------------------------------
+          # AISENSY EXTRACTION
+          # ---------------------------------------
 
           def field_after(lines, label):
-              for index, line in enumerate(lines[:-1]):
+              for i, line in enumerate(lines[:-1]):
                   if line.lower() == label.lower():
-                      return lines[index + 1]
+                      return lines[i + 1]
               return ""
 
           def metric(lines, label):
               values = []
 
-              for index, line in enumerate(lines[:-1]):
+              for i, line in enumerate(lines[:-1]):
                   if line.lower() != label.lower():
                       continue
 
-                  value = lines[index + 1]
+                  value = lines[i + 1]
 
                   if re.fullmatch(r"[\d,]+", value):
-                      values.append(int(value.replace(",", "")))
+                      values.append(
+                          int(value.replace(",", ""))
+                      )
 
               if not values:
-                  raise ValueError(f"Missing metric: {label}")
+                  raise ValueError(
+                      f"Missing metric: {label}"
+                  )
 
               return values[-1]
 
           def actual_cost(lines):
-              for index, line in enumerate(lines[:-1]):
+              for i, line in enumerate(lines[:-1]):
                   if line != "Total Credit Usage":
                       continue
 
                   match = re.fullmatch(
                       r"₹\s*([\d,]+(?:\.\d+)?)",
-                      lines[index + 1]
+                      lines[i + 1]
                   )
 
                   if match:
@@ -106,13 +102,15 @@ jobs:
                           match.group(1).replace(",", "")
                       )
 
-              raise ValueError("Missing Total Credit Usage")
+              raise ValueError(
+                  "Total Credit Usage not found"
+              )
 
           def actual_failed(text):
               patterns = [
                   r"\(\s*([\d,]+)\s*\)\s*Failed\b",
                   r"\bFailed\s*\(\s*([\d,]+)\s*\)",
-                  r"\bFailed\s*\n\s*([\d,]+)\s*(?:\n|$)",
+                  r"\bFailed\s*\n\s*([\d,]+)\s*(?:\n|$)"
               ]
 
               for pattern in patterns:
@@ -127,10 +125,15 @@ jobs:
                           match.group(1).replace(",", "")
                       )
 
-              raise ValueError("Missing actual Failed count")
+              raise ValueError(
+                  "Actual Failed count not found"
+              )
 
           def campaign_date(lines):
-              value = field_after(lines, "Created At")
+              value = field_after(
+                  lines,
+                  "Created At"
+              )
 
               if not value:
                   return ""
@@ -140,246 +143,89 @@ jobs:
                       value,
                       "%b %d, %Y, %I:%M %p"
                   ).strftime("%Y-%m-%d")
+
               except ValueError:
                   return ""
 
-          def page_indicator(page):
-              text = page.locator("body").inner_text()
-
-              match = re.search(
-                  r"(\d+)\s*-\s*(\d+)\s+of\s+([\d,]+)",
-                  text
-              )
-
-              if not match:
-                  return ""
-
-              return match.group(0)
-
-          def read_campaign_names(page):
-              text = page.locator("body").inner_text()
-              names = []
-
-              for match in CAMPAIGN_PATTERN.finditer(text):
-                  name = match.group(1).strip()
-
-                  if name and name not in names:
-                      names.append(name)
-
-              return names
-
-          def wait_for_campaign_names(page, timeout=20000):
-              deadline = time.monotonic() + timeout / 1000
-
-              while time.monotonic() < deadline:
-                  names = read_campaign_names(page)
-
-                  if names:
-                      return names
-
-                  page.wait_for_timeout(500)
-
-              return []
-
-          def wait_for_list(page):
-              page.get_by_text(
-                  "Rows per page:",
-                  exact=False
-              ).first.wait_for(timeout=30000)
-
-              names = wait_for_campaign_names(page)
-
-              if not names:
-                  raise RuntimeError(
-                      "Campaign list loaded but no "
-                      "broadcast names appeared."
-                  )
-
-              return names
-
-          def go_to_list(page):
+          def discover_campaign_names(page):
               page.goto(
                   LIST_URL,
                   wait_until="domcontentloaded",
                   timeout=60000
               )
 
-              return wait_for_list(page)
+              page.get_by_text(
+                  "Rows per page:",
+                  exact=False
+              ).first.wait_for(timeout=30000)
 
-          def click_next_page(page):
-              previous = page_indicator(page)
-
-              if not previous:
-                  return False
-
-              clicked = page.evaluate(
-                  """() => {
-                    const elements =
-                      [...document.querySelectorAll("*")];
-
-                    const label = elements.find(
-                      el =>
-                        el.children.length === 0 &&
-                        (el.textContent || "").trim() ===
-                        "Rows per page:"
-                    );
-
-                    if (!label) return false;
-
-                    let parent = label;
-
-                    for (let depth = 0; depth < 6; depth++) {
-                      parent = parent.parentElement;
-
-                      if (!parent) break;
-
-                      const buttons = [
-                        ...parent.querySelectorAll("button")
-                      ];
-
-                      if (buttons.length < 2) continue;
-
-                      const next = buttons[buttons.length - 1];
-
-                      if (
-                        next.disabled ||
-                        next.getAttribute("aria-disabled")
-                        === "true"
-                      ) {
-                        return false;
-                      }
-
-                      next.click();
-                      return true;
-                    }
-
-                    return false;
-                  }"""
+              pattern = re.compile(
+                  r"(?m)^([^\n]+)\n"
+                  r"BROADCAST\n\n?"
+                  r"([A-Za-z]{3} \d{1,2}, \d{4}, "
+                  r"\d{1,2}:\d{2} [AP]M)"
               )
 
-              if not clicked:
-                  return False
+              names = []
 
-              try:
-                  page.wait_for_function(
-                      """previous => {
-                        const text =
-                          document.body.innerText || "";
+              for attempt in range(30):
+                  text = page.locator(
+                      "body"
+                  ).inner_text()
 
-                        const match = text.match(
-                          /\\d+\\s*-\\s*\\d+\\s+of\\s+[\\d,]+/
-                        );
+                  names = []
 
-                        return match &&
-                          match[0] !== previous;
-                      }""",
-                      arg=previous,
-                      timeout=15000
-                  )
-              except Exception:
-                  print(
-                      "Pagination indicator did not change."
-                  )
-                  return False
+                  for match in pattern.finditer(text):
+                      name = match.group(1).strip()
 
-              return True
+                      if name and name not in names:
+                          names.append(name)
 
-          def discover_campaign_names(page):
-              go_to_list(page)
-
-              all_names = []
-
-              for page_number in range(1, MAX_PAGES + 1):
-                  indicator = page_indicator(page)
-
-                  # Important: pagination can update before
-                  # AiSensy's campaign cards finish rendering.
-                  names = wait_for_campaign_names(
-                      page,
-                      timeout=20000
-                  )
-
-                  print(
-                      f"Page {page_number}: "
-                      f"{indicator or 'unknown range'}, "
-                      f"{len(names)} broadcasts",
-                      flush=True
-                  )
-
-                  if not names:
-                      print(
-                          "No campaign names found on this "
-                          "page. Keeping earlier results.",
-                          flush=True
-                      )
+                  if len(names) >= MAX_CAMPAIGNS:
                       break
 
-                  for name in names:
-                      if name not in all_names:
-                          all_names.append(name)
+                  page.wait_for_timeout(500)
 
-                  if len(all_names) >= MAX_CAMPAIGNS:
-                      break
+              if len(names) < MAX_CAMPAIGNS:
+                  raise RuntimeError(
+                      f"Expected 5 campaigns, "
+                      f"found only {len(names)}. "
+                      "Spreadsheet will not be cleared."
+                  )
 
-                  if page_number == MAX_PAGES:
-                      break
-
-                  if not click_next_page(page):
-                      print(
-                          "Could not advance pagination. "
-                          "Keeping discovered campaigns.",
-                          flush=True
-                      )
-                      break
+              names = names[:MAX_CAMPAIGNS]
 
               print(
-                  f"Discovered {len(all_names)} "
-                  f"unique broadcast names",
+                  "Latest campaigns: "
+                  + ", ".join(names),
                   flush=True
               )
 
-              if not all_names:
-                  raise RuntimeError(
-                      "No broadcast campaigns discovered."
-                  )
-
-              return all_names[:MAX_CAMPAIGNS]
+              return names
 
           def open_campaign(page, name):
-              go_to_list(page)
-
-              for page_number in range(1, MAX_PAGES + 1):
-                  names = wait_for_campaign_names(
-                      page,
-                      timeout=20000
-                  )
-
-                  if name in names:
-                      target = page.get_by_text(
-                          name,
-                          exact=True
-                      ).first
-
-                      target.click(timeout=15000)
-
-                      page.wait_for_url(
-                          re.compile(
-                              r"/campaigns/all/view/[^/]+"
-                          ),
-                          timeout=20000
-                      )
-
-                      return page.url
-
-                  if page_number == MAX_PAGES:
-                      break
-
-                  if not click_next_page(page):
-                      break
-
-              raise ValueError(
-                  f"Could not find campaign: {name}"
+              page.goto(
+                  LIST_URL,
+                  wait_until="domcontentloaded",
+                  timeout=60000
               )
+
+              target = page.get_by_text(
+                  name,
+                  exact=True
+              ).first
+
+              target.wait_for(timeout=30000)
+              target.click(timeout=15000)
+
+              page.wait_for_url(
+                  re.compile(
+                      r"/campaigns/all/view/[^/]+"
+                  ),
+                  timeout=20000
+              )
+
+              return page.url
 
           def extract_campaign(page, url, name):
               page.goto(
@@ -395,7 +241,9 @@ jobs:
 
               page.wait_for_timeout(1000)
 
-              text = page.locator("body").inner_text()
+              text = page.locator(
+                  "body"
+              ).inner_text()
 
               lines = [
                   line.strip()
@@ -409,28 +257,54 @@ jobs:
               ).upper()
 
               if campaign_type != "BROADCAST":
-                  return None
+                  raise ValueError(
+                      "Campaign is not BROADCAST"
+                  )
 
-              audience = metric(lines, "Audience")
-              sent = metric(lines, "Sent")
-              delivered = metric(lines, "Delivered")
-              read = metric(lines, "Read")
+              audience = metric(
+                  lines,
+                  "Audience"
+              )
+
+              sent = metric(
+                  lines,
+                  "Sent"
+              )
+
+              delivered = metric(
+                  lines,
+                  "Delivered"
+              )
+
+              read = metric(
+                  lines,
+                  "Read"
+              )
+
               failed = actual_failed(text)
               cost = actual_cost(lines)
 
               if not (
                   audience >= sent >= delivered >= 0
               ):
-                  raise ValueError("Invalid message counts")
+                  raise ValueError(
+                      "Invalid audience/sent/delivered"
+                  )
 
               if not 0 <= read <= delivered:
-                  raise ValueError("Invalid read count")
+                  raise ValueError(
+                      "Invalid read count"
+                  )
 
               if not 0 <= failed <= audience:
-                  raise ValueError("Invalid failed count")
+                  raise ValueError(
+                      "Invalid failed count"
+                  )
 
               if cost < 0:
-                  raise ValueError("Invalid credit usage")
+                  raise ValueError(
+                      "Invalid cost"
+                  )
 
               return {
                   "id": url.rstrip("/").split("/")[-1],
@@ -445,13 +319,15 @@ jobs:
                   "cost": cost
               }
 
-          # Load AiSensy session securely from GitHub.
+          # ---------------------------------------
+          # FETCH AND VALIDATE ALL FIVE FIRST
+          # ---------------------------------------
+
           state = json.loads(
               os.environ["AISENSY_SESSION"]
           )
 
           campaigns = []
-          errors = []
 
           with sync_playwright() as p:
               browser = p.chromium.launch(
@@ -464,56 +340,62 @@ jobs:
 
               page = context.new_page()
 
-              names = discover_campaign_names(page)
+              names = discover_campaign_names(
+                  page
+              )
 
-              for index, name in enumerate(names, start=1):
+              for index, name in enumerate(
+                  names,
+                  start=1
+              ):
                   print(
-                      f"[{index}/{len(names)}] "
-                      f"Processing {name}",
+                      f"[{index}/5] Fetching {name}",
                       flush=True
                   )
 
-                  try:
-                      url = open_campaign(page, name)
+                  url = open_campaign(
+                      page,
+                      name
+                  )
 
-                      data = extract_campaign(
-                          page,
-                          url,
-                          name
-                      )
+                  campaign = extract_campaign(
+                      page,
+                      url,
+                      name
+                  )
 
-                      if data:
-                          campaigns.append(data)
+                  campaigns.append(campaign)
 
-                          print(
-                              f"Extracted {name}: "
-                              f"sent={data['sent']}, "
-                              f"delivered={data['delivered']}, "
-                              f"read={data['read']}, "
-                              f"failed={data['failed']}, "
-                              f"cost=INR {data['cost']}",
-                              flush=True
-                          )
-
-                  except Exception as error:
-                      errors.append(name)
-
-                      print(
-                          f"Skipped {name}: "
-                          f"{type(error).__name__}: "
-                          f"{str(error)[:180]}",
-                          flush=True
-                      )
+                  print(
+                      f"OK: {name} | "
+                      f"Sent={campaign['sent']} | "
+                      f"Delivered={campaign['delivered']} | "
+                      f"Read={campaign['read']} | "
+                      f"Failed={campaign['failed']} | "
+                      f"INR {campaign['cost']}",
+                      flush=True
+                  )
 
               browser.close()
 
-          if not campaigns:
+          if len(campaigns) != MAX_CAMPAIGNS:
               raise RuntimeError(
-                  "No valid campaigns extracted. "
-                  "Google Sheets was not modified."
+                  "Could not extract all five campaigns. "
+                  "Existing Google Sheets data preserved."
               )
 
-          # Connect to Google Sheets.
+          ids = [c["id"] for c in campaigns]
+
+          if len(set(ids)) != MAX_CAMPAIGNS:
+              raise RuntimeError(
+                  "Duplicate campaign IDs detected. "
+                  "Existing data preserved."
+              )
+
+          # ---------------------------------------
+          # CONNECT GOOGLE SHEETS
+          # ---------------------------------------
+
           credentials = (
               service_account.Credentials
               .from_service_account_info(
@@ -541,108 +423,479 @@ jobs:
 
           sheets = service.spreadsheets()
 
-          response = sheets.values().get(
-              spreadsheetId=spreadsheet_id,
-              range=f"'{SHEET_NAME}'!A2:A"
+          # Check all three tabs exist before clearing.
+          metadata = sheets.get(
+              spreadsheetId=spreadsheet_id
           ).execute()
 
-          existing = response.get("values", [])
+          sheet_ids = {
+              sheet["properties"]["title"]:
+              sheet["properties"]["sheetId"]
+              for sheet in metadata["sheets"]
+          }
 
-          existing_ids = {}
+          required_tabs = [
+              DATA_TAB,
+              COST_TAB,
+              DASHBOARD_TAB
+          ]
 
-          for index, row in enumerate(existing, start=2):
-              if row and row[0]:
-                  existing_ids[row[0]] = index
+          for tab in required_tabs:
+              if tab not in sheet_ids:
+                  raise RuntimeError(
+                      f"Missing Google Sheets tab: {tab}"
+                  )
 
-          next_row = len(existing) + 2
+          # ---------------------------------------
+          # BUILD BROADCAST_DATA
+          # ---------------------------------------
 
-          updates = []
-
-          now = datetime.now(
+          timestamp = datetime.now(
               timezone.utc
           ).isoformat()
 
-          for campaign in campaigns:
-              campaign_id = campaign["id"]
+          data_values = [[
+              "Campaign ID",
+              "Campaign Name",
+              "Date",
+              "Campaign Type",
+              "Audience Size",
+              "Sent",
+              "Delivered",
+              "Read",
+              "Failed",
+              "Delivery Rate",
+              "Read Rate",
+              "Cost per Message",
+              "Estimated Cost",
+              "Actual Cost",
+              "Last Updated"
+          ]]
 
-              if campaign_id in existing_ids:
-                  row = existing_ids[campaign_id]
-                  action = "UPDATE"
-
-              else:
-                  row = next_row
-                  next_row += 1
-
-                  existing_ids[campaign_id] = row
-                  action = "INSERT"
-
-              updates.extend([
-                  {
-                      "range": (
-                          f"'{SHEET_NAME}'!A{row}:I{row}"
-                      ),
-                      "values": [[
-                          campaign["id"],
-                          campaign["name"],
-                          campaign["date"],
-                          campaign["type"],
-                          campaign["audience"],
-                          campaign["sent"],
-                          campaign["delivered"],
-                          campaign["read"],
-                          campaign["failed"]
-                      ]]
-                  },
-                  {
-                      "range": (
-                          f"'{SHEET_NAME}'!J{row}:K{row}"
-                      ),
-                      "values": [[
-                          f"=IFERROR(G{row}/F{row},0)",
-                          f"=IFERROR(H{row}/G{row},0)"
-                      ]]
-                  },
-                  {
-                      "range": (
-                          f"'{SHEET_NAME}'!M{row}:O{row}"
-                      ),
-                      "values": [[
-                          (
-                              f'=IF(OR(G{row}="",'
-                              f'L{row}=""),"",'
-                              f'G{row}*L{row})'
-                          ),
-                          campaign["cost"],
-                          now
-                      ]]
-                  }
+          for index, c in enumerate(
+              campaigns,
+              start=2
+          ):
+              data_values.append([
+                  c["id"],
+                  c["name"],
+                  c["date"],
+                  c["type"],
+                  c["audience"],
+                  c["sent"],
+                  c["delivered"],
+                  c["read"],
+                  c["failed"],
+                  f"=IFERROR(G{index}/F{index},0)",
+                  f"=IFERROR(H{index}/G{index},0)",
+                  "",
+                  (
+                      f'=IF(OR(G{index}="",'
+                      f'L{index}=""),"",'
+                      f'G{index}*L{index})'
+                  ),
+                  c["cost"],
+                  timestamp
               ])
 
-              print(
-                  f"{action}: {campaign['name']} "
-                  f"-> row {row}",
-                  flush=True
+          # ---------------------------------------
+          # BUILD INDIVIDUAL COST SUMMARY
+          # ---------------------------------------
+
+          cost_values = [[
+              "Campaign Name",
+              "Date",
+              "Audience",
+              "Sent",
+              "Delivered",
+              "Read",
+              "Failed",
+              "Delivery Rate",
+              "Read Rate",
+              "Actual Cost (INR)",
+              "Cost per Delivered Message"
+          ]]
+
+          for index, c in enumerate(
+              campaigns,
+              start=2
+          ):
+              cost_values.append([
+                  c["name"],
+                  c["date"],
+                  c["audience"],
+                  c["sent"],
+                  c["delivered"],
+                  c["read"],
+                  c["failed"],
+                  (
+                      f"=IFERROR("
+                      f"E{index}/D{index},0)"
+                  ),
+                  (
+                      f"=IFERROR("
+                      f"F{index}/E{index},0)"
+                  ),
+                  c["cost"],
+                  (
+                      f"=IFERROR("
+                      f"J{index}/E{index},0)"
+                  )
+              ])
+
+          # Add totals after the five campaigns.
+          cost_values.append([
+              "TOTAL",
+              "",
+              "=SUM(C2:C6)",
+              "=SUM(D2:D6)",
+              "=SUM(E2:E6)",
+              "=SUM(F2:F6)",
+              "=SUM(G2:G6)",
+              "=IFERROR(E7/D7,0)",
+              "=IFERROR(F7/E7,0)",
+              "=SUM(J2:J6)",
+              "=IFERROR(J7/E7,0)"
+          ])
+
+          # ---------------------------------------
+          # BUILD DASHBOARD
+          # ---------------------------------------
+
+          dashboard_values = [
+              [
+                  "AISENSY BROADCAST DASHBOARD",
+                  ""
+              ],
+              [
+                  "Broadcasts Tracked",
+                  "=COUNTA(Broadcast_Data!A2:A6)"
+              ],
+              [
+                  "Messages Sent",
+                  "=SUM(Broadcast_Data!F2:F6)"
+              ],
+              [
+                  "Messages Delivered",
+                  "=SUM(Broadcast_Data!G2:G6)"
+              ],
+              [
+                  "Messages Read",
+                  "=SUM(Broadcast_Data!H2:H6)"
+              ],
+              [
+                  "Messages Failed",
+                  "=SUM(Broadcast_Data!I2:I6)"
+              ],
+              [
+                  "Total Actual Cost (INR)",
+                  "=SUM(Broadcast_Data!N2:N6)"
+              ],
+              [
+                  "Delivery Rate",
+                  "=IFERROR(B4/B3,0)"
+              ],
+              [
+                  "Read Rate",
+                  "=IFERROR(B5/B4,0)"
+              ],
+              [
+                  "Average Cost per Campaign",
+                  "=IFERROR(B7/B2,0)"
+              ],
+              [
+                  "Cost per Delivered Message",
+                  "=IFERROR(B7/B4,0)"
+              ],
+              [
+                  "Last Refresh",
+                  datetime.now(
+                      timezone.utc
+                  ).strftime(
+                      "%Y-%m-%d %H:%M UTC"
+                  )
+              ]
+          ]
+
+          dashboard_campaigns = [[
+              "Campaign Name",
+              "Sent",
+              "Delivered",
+              "Read",
+              "Failed",
+              "Actual Cost (INR)",
+              "Delivery Rate"
+          ]]
+
+          for index, c in enumerate(
+              campaigns,
+              start=2
+          ):
+              dashboard_campaigns.append([
+                  c["name"],
+                  c["sent"],
+                  c["delivered"],
+                  c["read"],
+                  c["failed"],
+                  c["cost"],
+                  (
+                      f"=IFERROR("
+                      f"F{index}/E{index},0)"
+                  )
+              ])
+
+          # Fix dashboard delivery rate formula
+          # to reference the dashboard comparison
+          # table's Sent and Delivered columns.
+          for index in range(
+              1,
+              len(dashboard_campaigns)
+          ):
+              row = index + 2
+
+              dashboard_campaigns[index][6] = (
+                  f"=IFERROR(F{row}/E{row},0)"
               )
+
+          # ---------------------------------------
+          # CLEAR ALL OLD CONTENTS
+          # ---------------------------------------
+          #
+          # This happens only AFTER all five
+          # campaigns have been extracted.
+          # ---------------------------------------
+
+          print(
+              "All 5 campaigns validated. "
+              "Replacing old reporting data...",
+              flush=True
+          )
+
+          sheets.values().batchClear(
+              spreadsheetId=spreadsheet_id,
+              body={
+                  "ranges": [
+                      f"'{DATA_TAB}'!A:O",
+                      f"'{COST_TAB}'!A:K",
+                      f"'{DASHBOARD_TAB}'!A:K"
+                  ]
+              }
+          ).execute()
+
+          # ---------------------------------------
+          # WRITE ALL THREE TABS
+          # ---------------------------------------
 
           sheets.values().batchUpdate(
               spreadsheetId=spreadsheet_id,
               body={
                   "valueInputOption": "USER_ENTERED",
-                  "data": updates
+                  "data": [
+                      {
+                          "range": (
+                              f"'{DATA_TAB}'!A1:O6"
+                          ),
+                          "values": data_values
+                      },
+                      {
+                          "range": (
+                              f"'{COST_TAB}'!A1:K7"
+                          ),
+                          "values": cost_values
+                      },
+                      {
+                          "range": (
+                              f"'{DASHBOARD_TAB}'!A1:B12"
+                          ),
+                          "values": dashboard_values
+                      },
+                      {
+                          "range": (
+                              f"'{DASHBOARD_TAB}'!D2:J7"
+                          ),
+                          "values": dashboard_campaigns
+                      }
+                  ]
+              }
+          ).execute()
+
+          # ---------------------------------------
+          # FORMAT REPORTS
+          # ---------------------------------------
+
+          requests = []
+
+          def grid_range(tab, start_row, end_row,
+                         start_col, end_col):
+              return {
+                  "sheetId": sheet_ids[tab],
+                  "startRowIndex": start_row,
+                  "endRowIndex": end_row,
+                  "startColumnIndex": start_col,
+                  "endColumnIndex": end_col
+              }
+
+          def number_format(
+              tab,
+              start_row,
+              end_row,
+              start_col,
+              end_col,
+              format_type,
+              pattern
+          ):
+              requests.append({
+                  "repeatCell": {
+                      "range": grid_range(
+                          tab,
+                          start_row,
+                          end_row,
+                          start_col,
+                          end_col
+                      ),
+                      "cell": {
+                          "userEnteredFormat": {
+                              "numberFormat": {
+                                  "type": format_type,
+                                  "pattern": pattern
+                              }
+                          }
+                      },
+                      "fields": (
+                          "userEnteredFormat.numberFormat"
+                      )
+                  }
+              })
+
+          # Percentages
+          number_format(
+              DATA_TAB, 1, 6, 9, 11,
+              "PERCENT", "0.00%"
+          )
+
+          number_format(
+              COST_TAB, 1, 7, 7, 9,
+              "PERCENT", "0.00%"
+          )
+
+          number_format(
+              DASHBOARD_TAB, 7, 9, 1, 2,
+              "PERCENT", "0.00%"
+          )
+
+          number_format(
+              DASHBOARD_TAB, 2, 7, 9, 10,
+              "PERCENT", "0.00%"
+          )
+
+          # Currency
+          for tab, sr, er, sc, ec in [
+              (DATA_TAB, 1, 6, 13, 14),
+              (COST_TAB, 1, 7, 9, 11),
+              (DASHBOARD_TAB, 6, 7, 1, 2),
+              (DASHBOARD_TAB, 9, 11, 1, 2),
+              (DASHBOARD_TAB, 2, 7, 8, 9)
+          ]:
+              number_format(
+                  tab, sr, er, sc, ec,
+                  "CURRENCY",
+                  '₹#,##0.00'
+              )
+
+          # Bold headers
+          for tab, row_start, row_end,
+              col_start, col_end in [
+                  (DATA_TAB, 0, 1, 0, 15),
+                  (COST_TAB, 0, 1, 0, 11),
+                  (DASHBOARD_TAB, 0, 1, 0, 2),
+                  (DASHBOARD_TAB, 1, 2, 3, 10)
+              ]:
+              requests.append({
+                  "repeatCell": {
+                      "range": grid_range(
+                          tab,
+                          row_start,
+                          row_end,
+                          col_start,
+                          col_end
+                      ),
+                      "cell": {
+                          "userEnteredFormat": {
+                              "textFormat": {
+                                  "bold": True
+                              }
+                          }
+                      },
+                      "fields": (
+                          "userEnteredFormat.textFormat.bold"
+                      )
+                  }
+              })
+
+          # Freeze headers
+          for tab in [
+              DATA_TAB,
+              COST_TAB
+          ]:
+              requests.append({
+                  "updateSheetProperties": {
+                      "properties": {
+                          "sheetId": sheet_ids[tab],
+                          "gridProperties": {
+                              "frozenRowCount": 1
+                          }
+                      },
+                      "fields": (
+                          "gridProperties.frozenRowCount"
+                      )
+                  }
+              })
+
+          # Auto-size columns
+          for tab, end_col in [
+              (DATA_TAB, 15),
+              (COST_TAB, 11),
+              (DASHBOARD_TAB, 10)
+          ]:
+              requests.append({
+                  "autoResizeDimensions": {
+                      "dimensions": {
+                          "sheetId": sheet_ids[tab],
+                          "dimension": "COLUMNS",
+                          "startIndex": 0,
+                          "endIndex": end_col
+                      }
+                  }
+              })
+
+          sheets.batchUpdate(
+              spreadsheetId=spreadsheet_id,
+              body={
+                  "requests": requests
               }
           ).execute()
 
           print(
-              f"SUCCESS: Updated "
-              f"{len(campaigns)} broadcasts "
-              f"in Google Sheets",
+              "SUCCESS: Only latest 5 campaigns "
+              "are now in Google Sheets.",
               flush=True
           )
 
-          if errors:
-              print(
-                  f"WARNING: {len(errors)} "
-                  f"campaign(s) were skipped.",
-                  flush=True
-              )
+          print(
+              "Cost Summary: 5 individual campaigns "
+              "plus totals.",
+              flush=True
+          )
+
+          print(
+              "Dashboard: KPIs and campaign "
+              "comparison populated.",
+              flush=True
+          )
+
+          print(
+              "Next automatic run: "
+              "every 2 hours (UTC cron).",
+              flush=True
+          )
           PY
