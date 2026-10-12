@@ -33,9 +33,8 @@ jobs:
 
           if not username or not password:
               raise RuntimeError(
-                  "Missing GitHub Secrets. "
-                  "Add AISENSY_EMAIL and AISENSY_PASSWORD "
-                  "under Settings > Secrets and variables > Actions."
+                  "Missing credentials. Add AISENSY_EMAIL and "
+                  "AISENSY_PASSWORD to GitHub Repository Secrets."
               )
 
           dashboard_url = (
@@ -62,7 +61,7 @@ jobs:
 
                   password_field = page.locator(
                       'input[type="password"]'
-                  )
+                  ).first
 
                   username_field.fill(username)
                   password_field.fill(password)
@@ -71,16 +70,18 @@ jobs:
 
                   page.wait_for_timeout(2000)
 
-                  continue_button = page.get_by_text(
-                      "Continue",
+                  continue_button = page.get_by_role(
+                      "button",
+                      name="Continue",
                       exact=True
                   )
 
-                  button_enabled = continue_button.is_enabled()
+                  print(
+                      "Continue button enabled:",
+                      continue_button.is_enabled()
+                  )
 
-                  print("Continue button enabled:", button_enabled)
-
-                  if not button_enabled:
+                  if not continue_button.is_enabled():
                       print(
                           "Username field valid:",
                           username_field.evaluate(
@@ -96,8 +97,8 @@ jobs:
                       )
 
                       raise RuntimeError(
-                          "Continue button disabled. "
-                          "Check login identifier format and validation."
+                          "Continue button is disabled. "
+                          "Check login form validation."
                       )
 
                   print("Submitting login...")
@@ -106,14 +107,21 @@ jobs:
 
                   page.wait_for_timeout(6000)
 
-                  print("Checking authentication status...")
-
-                  # Do not print the full URL because
-                  # authentication redirects may contain tokens.
-                  print(
-                      "Still on login page:",
-                      "/login" in page.url
+                  # Check for OTP without printing sensitive data
+                  otp_fields = page.locator(
+                      'input[autocomplete="one-time-code"], '
+                      'input[name*="otp" i], '
+                      'input[placeholder*="otp" i]'
                   )
+
+                  if otp_fields.count() > 0:
+                      print(
+                          "OTP verification detected. "
+                          "Manual verification may be required."
+                      )
+                      raise RuntimeError(
+                          "Login requires OTP verification."
+                      )
 
                   print("Checking dashboard access...")
 
@@ -127,13 +135,13 @@ jobs:
 
                   if "/login" in page.url:
                       raise RuntimeError(
-                          "Dashboard authentication not confirmed. "
-                          "Login may require OTP or other verification."
+                          "Dashboard requires authentication. "
+                          "Login may have failed or require verification."
                       )
 
                   if "/dashboard" not in page.url:
                       raise RuntimeError(
-                          "Unexpected navigation after login. "
+                          "Unexpected page after login. "
                           "Dashboard access not confirmed."
                       )
 
