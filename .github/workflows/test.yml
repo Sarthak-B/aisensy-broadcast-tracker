@@ -1,4 +1,4 @@
-name: Test AiSensy Campaign Analytics
+name: Test AiSensy Broadcast Details
 
 on:
   workflow_dispatch:
@@ -18,7 +18,7 @@ jobs:
           pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: Inspect AiSensy Campaigns
+      - name: Inspect Broadcast Details
         env:
           AISENSY_SESSION: ${{ secrets.AISENSY_SESSION }}
         run: |
@@ -29,62 +29,56 @@ jobs:
 
           state = json.loads(os.environ["AISENSY_SESSION"])
 
-          dashboard = (
+          url = (
               "https://www.app.aisensy.com/projects/"
-              "6589906ef69fc70b424e0e43/dashboard"
+              "6589906ef69fc70b424e0e43/campaigns/all"
           )
 
           with sync_playwright() as p:
               browser = p.chromium.launch(headless=True)
-              context = browser.new_context(storage_state=state)
+
+              context = browser.new_context(
+                  storage_state=state,
+                  viewport={"width": 1440, "height": 900}
+              )
+
               page = context.new_page()
 
               page.goto(
-                  dashboard,
+                  url,
                   wait_until="domcontentloaded",
                   timeout=60000
               )
 
-              page.wait_for_timeout(5000)
-
-              if "/login" in page.url:
-                  raise RuntimeError(
-                      "Session expired. Please refresh AISENSY_SESSION."
-                  )
-
-              print("Authenticated dashboard loaded.")
-
-              # Find the Campaigns navigation item
-              campaigns = page.get_by_text(
-                  "Campaigns",
+              page.get_by_text(
+                  "10amremi",
                   exact=True
-              )
+              ).first.wait_for(timeout=30000)
 
-              print("Campaigns matches:", campaigns.count())
+              print("Campaign found: 10amremi")
 
-              if campaigns.count() == 0:
-                  raise RuntimeError(
-                      "Campaigns navigation item not found."
-                  )
+              campaign = page.get_by_text(
+                  "10amremi",
+                  exact=True
+              ).first
 
-              # Click Campaigns
-              campaigns.first.click(timeout=15000)
+              campaign.click(timeout=15000)
 
               page.wait_for_timeout(8000)
 
-              print("Campaigns page URL:", page.url)
+              print("Details page URL:", page.url)
 
-              # Print visible campaign-related text
               body = page.locator("body").inner_text(
                   timeout=15000
               )
 
-              print("\n--- CAMPAIGNS PAGE PREVIEW ---")
+              print("\n--- BROADCAST DETAILS ---")
 
-              # Avoid dumping the entire page into logs.
-              print(body[:3500])
+              # Print only a limited preview.
+              # Check for private data before sharing logs.
+              print(body[:5000])
 
-              print("--- END PREVIEW ---")
+              print("--- END DETAILS ---")
 
               browser.close()
           PY
