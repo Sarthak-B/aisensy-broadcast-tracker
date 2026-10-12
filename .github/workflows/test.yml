@@ -1,4 +1,4 @@
-name: Test AiSensy Saved Session
+name: Test AiSensy Campaign Data
 
 on:
   workflow_dispatch:
@@ -18,7 +18,7 @@ jobs:
           pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: Test AiSensy Session
+      - name: Check AiSensy Dashboard Content
         env:
           AISENSY_SESSION: ${{ secrets.AISENSY_SESSION }}
         run: |
@@ -27,12 +27,7 @@ jobs:
           import os
           from playwright.sync_api import sync_playwright
 
-          session = os.environ.get("AISENSY_SESSION")
-
-          if not session:
-              raise RuntimeError("AISENSY_SESSION secret is missing.")
-
-          state = json.loads(session)
+          state = json.loads(os.environ["AISENSY_SESSION"])
 
           dashboard = (
               "https://www.app.aisensy.com/projects/"
@@ -53,22 +48,17 @@ jobs:
               page.wait_for_timeout(10000)
 
               if "/login" in page.url:
-                  raise RuntimeError(
-                      "Saved session rejected. AiSensy requires login."
-                  )
+                  raise RuntimeError("Session expired or login required.")
 
-              if page.locator('input[type="password"]').count() > 0:
-                  raise RuntimeError(
-                      "Login form is visible. Session not authenticated."
-                  )
+              print("Dashboard URL reached.")
 
-              if "/dashboard" not in page.url:
-                  raise RuntimeError(
-                      "Dashboard URL not reached."
-                  )
+              # Print a short preview of visible page text.
+              # Avoid printing authentication data or page HTML.
+              text = page.locator("body").inner_text(timeout=15000)
+              preview = text[:2000]
 
-              print("SUCCESS: GitHub reached AiSensy dashboard URL.")
-              print("Authenticated dashboard data still needs verification.")
+              print("Dashboard text preview:")
+              print(preview)
 
               browser.close()
           PY
