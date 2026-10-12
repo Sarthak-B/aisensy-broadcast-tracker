@@ -248,23 +248,17 @@ jobs:
 
           sync_time = ist_now()
           new_ids = {rec['Campaign ID'] for rec in fetched if rec['Campaign ID'] not in existing_by_id}
-          if not new_ids:
-              # A scheduled check happened, but there is no new campaign to add.
-              # Keep all campaign metrics and summaries untouched.
-              status = ('No campaign data fetched; nothing was updated' if not fetched
-                        else 'No new campaigns; nothing was updated')
-              update_values(dashboard_ws, 'A13:B14', [
-                  ['Last Sync (IST)', sync_time],
-                  ['Campaigns Added This Sync', 0],
-              ])
-              update_values(dashboard_ws, 'C14', [[status]])
-              print(f'Sync check complete: {status}. Dashboard sync time updated.', flush=True)
-              raise SystemExit(0)
-          print(f'{len(new_ids)} new broadcast(s) found; refreshing the sheets.', flush=True)
+          # Always rebuild the three views to normalize older UTC timestamps and
+          # keep newest campaigns at the top. Existing metrics are not refreshed
+          # unless at least one new campaign was discovered.
+          if new_ids:
+              print(f'{len(new_ids)} new broadcast(s) found; refreshing campaign metrics.', flush=True)
+          else:
+              print('No new broadcasts; retaining existing metrics and normalizing display.', flush=True)
 
           new_count = 0
           updated_count = 0
-          for rec in fetched:
+          for rec in (fetched if new_ids else []):
               cid = rec['Campaign ID']
               if cid in existing_by_id:
                   old = existing_by_id[cid]
@@ -276,13 +270,26 @@ jobs:
                   new_count += 1
               existing_by_id[cid] = rec
 
-          records = [existing_by_id[cid] for cid in order]
+          # Date descending, with newly fetched campaigns first within the same
+          # date. Preserve existing relative order for other same-day campaigns.
+          fetched_rank = {rec['Campaign ID']: idx for idx, rec in enumerate(fetched)} if new_ids else {}
+          original_rank = {cid: idx for idx, cid in enumerate(order)}
+          records = sorted(
+              (existing_by_id[cid] for cid in order),
+              key=lambda rec: (
+                  str(rec.get('Date') or ''),
+                  1 if rec['Campaign ID'] in fetched_rank else 0,
+                  -fetched_rank.get(rec['Campaign ID'], original_rank[rec['Campaign ID']]),
+              ),
+              reverse=True,
+          )
           data_rows = [output_row(rec) for rec in records]
           ensure_rows(data_ws, len(data_rows) + 1)
           update_values(data_ws, 'A1:O1', [HEADERS])
           update_values(data_ws, f'A2:O{len(data_rows)+1}', data_rows)
           if len(existing_rows) > len(data_rows) + 1:
               data_ws.batch_clear([f'A{len(data_rows)+2}:O{len(existing_rows)}'])
+          data_ws.format(f'O2:O{len(data_rows)+1}', {'numberFormat': {'type': 'TEXT'}})
           data_ws.format(f'E2:I{len(data_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
           data_ws.format(f'J2:K{len(data_rows)+1}', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
           data_ws.format(f'L2:L{len(data_rows)+1}', {'numberFormat': {'type': 'CURRENCY', 'pattern': '₹#,##0.000'}})
@@ -309,6 +316,7 @@ jobs:
           update_values(summary_ws, f'A1:L{len(summary_rows)+1}', [summary_header] + summary_rows)
           if previous_summary > len(summary_rows) + 1:
               summary_ws.batch_clear([f'A{len(summary_rows)+2}:L{previous_summary}'])
+          summary_ws.format(f'L2:L{len(summary_rows)+1}', {'numberFormat': {'type': 'TEXT'}})
           summary_ws.format(f'D2:H{len(summary_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
           summary_ws.format(f'I2:K{len(summary_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0.000'}})
 
@@ -331,7 +339,7 @@ jobs:
               ['Overall Read Rate', total_read / total_delivered if total_delivered else 0],
               ['Average Cost per Sent Message', total_cost / total_sent if total_sent else 0],
               ['Last Sync (IST)', sync_time],
-              ['Campaigns Added This Sync', new_count, f'{new_count} new campaign(s) added'],
+              ['Campaigns Added This Sync', new_count, (f'{new_count} new campaign(s) added' if new_count else ('No campaign data fetched; nothing was updated' if not fetched else 'No new campaigns; nothing was updated'))],
               ['CAMPAIGN PERFORMANCE'],
               ['Campaign Name', 'Date', 'Sent', 'Delivered', 'Read', 'Failed', 'Delivery Rate', 'Read Rate', 'Actual Cost (INR)'],
           ]
@@ -346,6 +354,7 @@ jobs:
           ensure_rows(dashboard_ws, len(dashboard))
           dashboard_ws.batch_clear([f'A1:O{max(previous_dashboard, len(dashboard))}'])
           update_values(dashboard_ws, f'A1:I{len(dashboard)}', dashboard)
+          dashboard_ws.format('B13', {'numberFormat': {'type': 'TEXT'}})
           dashboard_ws.format('B2:B7', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
           dashboard_ws.format('B10:B11', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
           dashboard_ws.format('B8:B9', {'numberFormat': {'type': 'CURRENCY', 'pattern': '₹#,##0.00'}})
