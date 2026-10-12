@@ -1,10 +1,10 @@
-name: Test AiSensy Broadcast Details
+name: Export AiSensy Broadcast Analytics
 
 on:
   workflow_dispatch:
 
 jobs:
-  test:
+  export:
     runs-on: ubuntu-latest
 
     steps:
@@ -18,67 +18,131 @@ jobs:
           pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: Inspect Broadcast Details
+      - name: Extract Campaign Analytics
         env:
           AISENSY_SESSION: ${{ secrets.AISENSY_SESSION }}
         run: |
           python - <<'PY'
+          import csv
           import json
           import os
+          import re
+          from datetime import datetime, timezone
           from playwright.sync_api import sync_playwright
+
+          PROJECT_ID = "6589906ef69fc70b424e0e43"
+          BASE = f"https://www.app.aisensy.com/projects/{PROJECT_ID}"
+
+          # Start with one verified campaign.
+          CAMPAIGNS = {
+              "10amremi": "6acc6b9be85c517b3c81b4b9"
+          }
 
           state = json.loads(os.environ["AISENSY_SESSION"])
 
-          url = (
-              "https://www.app.aisensy.com/projects/"
-              "6589906ef69fc70b424e0e43/campaigns/all"
-          )
+          def metric(text, label):
+              match = re.search(
+                  rf"(?m)^{re.escape(label)}\s*\n\s*(\d+)\s*$",
+                  text
+              )
+              return int(match.group(1)) if match else None
+
+          def credit_usage(text):
+              match = re.search(
+                  r"Total Credit Usage\s*\n\s*₹\s*([\d,]+(?:\.\d+)?)",
+                  text
+              )
+              return float(match.group(1).replace(",", "")) if match else None
+
+          rows = []
 
           with sync_playwright() as p:
               browser = p.chromium.launch(headless=True)
-
-              context = browser.new_context(
-                  storage_state=state,
-                  viewport={"width": 1440, "height": 900}
-              )
-
+              context = browser.new_context(storage_state=state)
               page = context.new_page()
 
-              page.goto(
-                  url,
-                  wait_until="domcontentloaded",
-                  timeout=60000
-              )
+              for name, campaign_id in CAMPAIGNS.items():
+                  url = f"{BASE}/campaigns/all/view/{campaign_id}"
 
-              page.get_by_text(
-                  "10amremi",
-                  exact=True
-              ).first.wait_for(timeout=30000)
+                  page.goto(
+                      url,
+                      wait_until="domcontentloaded",
+                      timeout=60000
+                  )
 
-              print("Campaign found: 10amremi")
+                  page.get_by_text(
+                      "Total Credit Usage",
+                      exact=True
+                  ).first.wait_for(timeout=30000)
 
-              campaign = page.get_by_text(
-                  "10amremi",
-                  exact=True
-              ).first
+                  body = page.locator("body").inner_text()
 
-              campaign.click(timeout=15000)
+                  # Read the labeled values from the campaign
+                  # details section, rather than the summary cards.
+                  audience = metric(body, "Audience")
+                  sent = metric(body, "Sent")
+                  delivered = metric(body, "Delivered")
+                  read = metric(body, "Read")
+                  clicked = metric(body, "Clicked")
+                  replied = metric(body, "Replied")
+                  cost = credit_usage(body)
 
-              page.wait_for_timeout(8000)
+                  # Failed is not separately labeled in the
+                  # details section, so calculate from audience
+                  # minus sent for this initial test.
+                  failed = (
+                      audience - sent
+                      if audience is not None and sent is not None
+                      else None
+                  )
 
-              print("Details page URL:", page.url)
+                  if any(v is None for v in [
+                      audience, sent, delivered, read, cost
+                  ]):
+                      raise RuntimeError(
+                          f"Missing required analytics for {name}"
+                      )
 
-              body = page.locator("body").inner_text(
-                  timeout=15000
-              )
+                  rows.append({
+                      "Campaign ID": campaign_id,
+                      "Campaign Name": name,
+                      "Audience Size": audience,
+                      "Sent": sent,
+                      "Delivered": delivered,
+                      "Read": read,
+                      "Clicked": clicked,
+                      "Replied": replied,
+                      "Failed": failed,
+                      "Actual Cost": cost,
+                      "Last Updated": datetime.now(
+                          timezone.utc
+                      ).isoformat()
+                  })
 
-              print("\n--- BROADCAST DETAILS ---")
-
-              # Print only a limited preview.
-              # Check for private data before sharing logs.
-              print(body[:5000])
-
-              print("--- END DETAILS ---")
+                  print(
+                      f"{name}: audience={audience}, "
+                      f"sent={sent}, delivered={delivered}, "
+                      f"read={read}, cost=INR {cost}"
+                  )
 
               browser.close()
+
+          filename = "aisensy_broadcast_data.csv"
+
+          with open(filename, "w", newline="", encoding="utf-8") as f:
+              writer = csv.DictWriter(
+                  f,
+                  fieldnames=list(rows[0].keys())
+              )
+              writer.writeheader()
+              writer.writerows(rows)
+
+          print(f"Exported {len(rows)} campaign(s).")
           PY
+
+      - name: Upload CSV Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: aisensy-broadcast-report
+          path: aisensy_broadcast_data.csv
+          retention-days: 7
