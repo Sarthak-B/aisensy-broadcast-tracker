@@ -37,6 +37,7 @@ jobs:
           import os
           import re
           from datetime import datetime, timezone
+          from zoneinfo import ZoneInfo
           from playwright.sync_api import sync_playwright
           import gspread
           from google.oauth2.service_account import Credentials
@@ -45,6 +46,25 @@ jobs:
           LIST_URL = f'https://www.app.aisensy.com/projects/{PROJECT_ID}/campaigns/all'
           MAX_CAMPAIGNS = 5
           SHEET_ID = os.environ.get('GOOGLE_SHEET_ID', '').strip() or '1jXnQPQngi-FbEBBHC0tvaOTXxmtE5_miv6Mq0rTbmLQ'
+          IST = ZoneInfo('Asia/Kolkata')
+
+          def ist_now():
+              return datetime.now(IST).strftime('%Y-%m-%d %I:%M:%S %p IST')
+
+          def existing_time_to_ist(value):
+              value = str(value or '').strip()
+              if not value:
+                  return value
+              if value.endswith(' IST'):
+                  return value
+              try:
+                  parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+                  if parsed.tzinfo is None:
+                      parsed = parsed.replace(tzinfo=timezone.utc)
+                  return parsed.astimezone(IST).strftime('%Y-%m-%d %I:%M:%S %p IST')
+              except ValueError:
+                  return value
+
           HEADERS = ['Campaign ID', 'Campaign Name', 'Date', 'Campaign Type', 'Audience Size', 'Sent', 'Delivered', 'Read', 'Failed', 'Delivery Rate', 'Read Rate', 'Cost per Message', 'Estimated Cost', 'Actual Cost', 'Last Updated']
 
           def number(value, default=0.0):
@@ -152,7 +172,7 @@ jobs:
                   **values,
                   'Cost per Message': (values['Actual Cost'] / values['Sent']) if values['Sent'] else 0.0,
                   'Estimated Cost': '',
-                  'Last Updated': datetime.now(timezone.utc).isoformat(),
+                  'Last Updated': ist_now(),
               }
               print(f"Fetched {name}: sent={record['Sent']}, delivered={record['Delivered']}, cost=INR {record['Actual Cost']}", flush=True)
               return record
@@ -164,6 +184,7 @@ jobs:
                   rec[field] = count(rec[field])
               for field in ('Cost per Message', 'Estimated Cost', 'Actual Cost'):
                   rec[field] = number(rec[field])
+              rec['Last Updated'] = existing_time_to_ist(rec.get('Last Updated', ''))
               rec['Campaign ID'] = str(rec['Campaign ID']).strip()
               return rec
 
@@ -225,7 +246,7 @@ jobs:
                       print(f'WARNING: Skipped {name}: {exc}', flush=True)
               browser.close()
 
-          sync_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+          sync_time = ist_now()
           new_ids = {rec['Campaign ID'] for rec in fetched if rec['Campaign ID'] not in existing_by_id}
           if not new_ids:
               # A scheduled check happened, but there is no new campaign to add.
@@ -233,7 +254,7 @@ jobs:
               status = ('No campaign data fetched; nothing was updated' if not fetched
                         else 'No new campaigns; nothing was updated')
               update_values(dashboard_ws, 'A13:B14', [
-                  ['Last Sync (UTC)', sync_time],
+                  ['Last Sync (IST)', sync_time],
                   ['Campaigns Added This Sync', 0],
               ])
               update_values(dashboard_ws, 'C14', [[status]])
@@ -309,7 +330,7 @@ jobs:
               ['Overall Delivery Rate', total_delivered / total_sent if total_sent else 0],
               ['Overall Read Rate', total_read / total_delivered if total_delivered else 0],
               ['Average Cost per Sent Message', total_cost / total_sent if total_sent else 0],
-              ['Last Sync (UTC)', sync_time],
+              ['Last Sync (IST)', sync_time],
               ['Campaigns Added This Sync', new_count, f'{new_count} new campaign(s) added'],
               ['CAMPAIGN PERFORMANCE'],
               ['Campaign Name', 'Date', 'Sent', 'Delivered', 'Read', 'Failed', 'Delivery Rate', 'Read Rate', 'Actual Cost (INR)'],
