@@ -1,4 +1,4 @@
-name: Test AiSensy Page
+name: Test AiSensy Dashboard
 
 on:
   workflow_dispatch:
@@ -18,32 +18,46 @@ jobs:
           pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: Inspect AiSensy Page
+      - name: Test AiSensy Dashboard
         run: |
           python - <<'PY'
           from playwright.sync_api import sync_playwright
+
+          url = (
+              "https://www.app.aisensy.com/projects/"
+              "6589906ef69fc70b424e0e43/dashboard"
+          )
 
           with sync_playwright() as p:
               browser = p.chromium.launch(headless=True)
               page = browser.new_page()
 
-              print("Opening AiSensy...")
+              try:
+                  print("Opening AiSensy dashboard...")
 
-              page.goto(
-                  "https://backend.aisensy.com",
-                  wait_until="domcontentloaded",
-                  timeout=60000
-              )
+                  response = page.goto(
+                      url,
+                      wait_until="domcontentloaded",
+                      timeout=60000
+                  )
 
-              page.wait_for_timeout(10000)
+                  page.wait_for_timeout(10000)
 
-              print("Final URL:", page.url)
-              print("Page title:", page.title())
+                  print("HTTP status:",
+                        response.status if response else "Unknown")
 
-              print("Visible page text:")
-              print(page.locator("body").inner_text(timeout=10000)[:1500])
+                  print("Final URL:", page.url)
+                  print("Page title:", page.title())
 
-              print("Page inspection completed.")
+                  print("Visible page text:")
+                  print(page.locator("body").inner_text()[:1000])
 
-              browser.close()
+                  print("Dashboard access test completed.")
+
+              except Exception as e:
+                  print("ERROR:", str(e))
+                  raise
+
+              finally:
+                  browser.close()
           PY
