@@ -31,113 +31,207 @@ jobs:
           from playwright.sync_api import sync_playwright
 
           PROJECT_ID = "6589906ef69fc70b424e0e43"
-          BASE = f"https://www.app.aisensy.com/projects/{PROJECT_ID}"
+          CAMPAIGN_ID = "6acc6b9be85c517b3c81b4b9"
+          CAMPAIGN_NAME = "10amremi"
 
-          # Start with one verified campaign.
-          CAMPAIGNS = {
-              "10amremi": "6acc6b9be85c517b3c81b4b9"
-          }
+          URL = (
+              f"https://www.app.aisensy.com/projects/"
+              f"{PROJECT_ID}/campaigns/all/view/{CAMPAIGN_ID}"
+          )
 
-          state = json.loads(os.environ["AISENSY_SESSION"])
+          session = os.environ.get("AISENSY_SESSION")
 
-          def metric(text, label):
-              match = re.search(
-                  rf"(?m)^{re.escape(label)}\s*\n\s*(\d+)\s*$",
-                  text
+          if not session:
+              raise RuntimeError(
+                  "Missing AISENSY_SESSION GitHub secret."
               )
-              return int(match.group(1)) if match else None
 
-          def credit_usage(text):
-              match = re.search(
-                  r"Total Credit Usage\s*\n\s*₹\s*([\d,]+(?:\.\d+)?)",
-                  text
-              )
-              return float(match.group(1).replace(",", "")) if match else None
+          state = json.loads(session)
 
-          rows = []
+          def extract_number(lines, label):
+              """
+              Find an exact metric label followed by its value.
+              Uses the last matching occurrence to avoid
+              percentage summary cards.
+              """
+              matches = []
+
+              for i, line in enumerate(lines[:-1]):
+                  if line.strip().lower() == label.lower():
+                      next_line = lines[i + 1].strip()
+
+                      if re.fullmatch(r"[\d,]+", next_line):
+                          matches.append(
+                              int(next_line.replace(",", ""))
+                          )
+
+              if not matches:
+                  raise ValueError(
+                      f"Could not extract metric: {label}"
+                  )
+
+              return matches[-1]
+
+          def extract_cost(lines):
+              costs = []
+
+              for i, line in enumerate(lines[:-1]):
+                  if line.strip() == "Total Credit Usage":
+                      value = lines[i + 1].strip()
+
+                      match = re.fullmatch(
+                          r"₹\s*([\d,]+(?:\.\d+)?)",
+                          value
+                      )
+
+                      if match:
+                          costs.append(
+                              float(
+                                  match.group(1).replace(",", "")
+                              )
+                          )
+
+              if not costs:
+                  raise ValueError(
+                      "Could not extract Total Credit Usage"
+                  )
+
+              return costs[-1]
 
           with sync_playwright() as p:
               browser = p.chromium.launch(headless=True)
-              context = browser.new_context(storage_state=state)
+
+              context = browser.new_context(
+                  storage_state=state,
+                  viewport={
+                      "width": 1440,
+                      "height": 900
+                  }
+              )
+
               page = context.new_page()
 
-              for name, campaign_id in CAMPAIGNS.items():
-                  url = f"{BASE}/campaigns/all/view/{campaign_id}"
+              print("Opening AiSensy campaign...")
 
-                  page.goto(
-                      url,
-                      wait_until="domcontentloaded",
-                      timeout=60000
+              page.goto(
+                  URL,
+                  wait_until="domcontentloaded",
+                  timeout=60000
+              )
+
+              page.get_by_text(
+                  "Total Credit Usage",
+                  exact=True
+              ).first.wait_for(timeout=30000)
+
+              page.wait_for_timeout(5000)
+
+              if "/login" in page.url:
+                  raise RuntimeError(
+                      "AiSensy session expired."
                   )
 
-                  page.get_by_text(
-                      "Total Credit Usage",
-                      exact=True
-                  ).first.wait_for(timeout=30000)
+              body = page.locator("body").inner_text(
+                  timeout=15000
+              )
 
-                  body = page.locator("body").inner_text()
+              lines = [
+                  line.strip()
+                  for line in body.splitlines()
+                  if line.strip()
+              ]
 
-                  # Read the labeled values from the campaign
-                  # details section, rather than the summary cards.
-                  audience = metric(body, "Audience")
-                  sent = metric(body, "Sent")
-                  delivered = metric(body, "Delivered")
-                  read = metric(body, "Read")
-                  clicked = metric(body, "Clicked")
-                  replied = metric(body, "Replied")
-                  cost = credit_usage(body)
+              audience = extract_number(
+                  lines, "Audience"
+              )
 
-                  # Failed is not separately labeled in the
-                  # details section, so calculate from audience
-                  # minus sent for this initial test.
-                  failed = (
-                      audience - sent
-                      if audience is not None and sent is not None
-                      else None
+              sent = extract_number(
+                  lines, "Sent"
+              )
+
+              delivered = extract_number(
+                  lines, "Delivered"
+              )
+
+              read = extract_number(
+                  lines, "Read"
+              )
+
+              clicked = extract_number(
+                  lines, "Clicked"
+              )
+
+              replied = extract_number(
+                  lines, "Replied"
+              )
+
+              actual_cost = extract_cost(lines)
+
+              # Temporary calculation for this test campaign.
+              # The final automation should read AiSensy's
+              # actual failed metric directly.
+              failed = audience - sent
+
+              if not (
+                  audience >= sent >= delivered >= 0
+              ):
+                  raise ValueError(
+                      "Campaign metrics failed validation."
                   )
 
-                  if any(v is None for v in [
-                      audience, sent, delivered, read, cost
-                  ]):
-                      raise RuntimeError(
-                          f"Missing required analytics for {name}"
-                      )
-
-                  rows.append({
-                      "Campaign ID": campaign_id,
-                      "Campaign Name": name,
-                      "Audience Size": audience,
-                      "Sent": sent,
-                      "Delivered": delivered,
-                      "Read": read,
-                      "Clicked": clicked,
-                      "Replied": replied,
-                      "Failed": failed,
-                      "Actual Cost": cost,
-                      "Last Updated": datetime.now(
-                          timezone.utc
-                      ).isoformat()
-                  })
-
-                  print(
-                      f"{name}: audience={audience}, "
-                      f"sent={sent}, delivered={delivered}, "
-                      f"read={read}, cost=INR {cost}"
+              if actual_cost <= 0:
+                  raise ValueError(
+                      "Actual cost must be positive "
+                      "for this test campaign."
                   )
+
+              print("\n--- EXTRACTED ANALYTICS ---")
+              print("Campaign:", CAMPAIGN_NAME)
+              print("Audience:", audience)
+              print("Sent:", sent)
+              print("Delivered:", delivered)
+              print("Read:", read)
+              print("Clicked:", clicked)
+              print("Replied:", replied)
+              print("Failed (calculated):", failed)
+              print("Actual Cost: INR", actual_cost)
+              print("---------------------------")
 
               browser.close()
 
+          row = {
+              "Campaign ID": CAMPAIGN_ID,
+              "Campaign Name": CAMPAIGN_NAME,
+              "Audience Size": audience,
+              "Sent": sent,
+              "Delivered": delivered,
+              "Read": read,
+              "Clicked": clicked,
+              "Replied": replied,
+              "Failed": failed,
+              "Actual Cost": actual_cost,
+              "Last Updated": datetime.now(
+                  timezone.utc
+              ).isoformat()
+          }
+
           filename = "aisensy_broadcast_data.csv"
 
-          with open(filename, "w", newline="", encoding="utf-8") as f:
+          with open(
+              filename,
+              "w",
+              newline="",
+              encoding="utf-8"
+          ) as file:
               writer = csv.DictWriter(
-                  f,
-                  fieldnames=list(rows[0].keys())
+                  file,
+                  fieldnames=list(row.keys())
               )
-              writer.writeheader()
-              writer.writerows(rows)
 
-          print(f"Exported {len(rows)} campaign(s).")
+              writer.writeheader()
+              writer.writerow(row)
+
+          print("\nCSV exported successfully!")
           PY
 
       - name: Upload CSV Report
