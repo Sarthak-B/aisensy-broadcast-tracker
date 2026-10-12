@@ -46,7 +46,6 @@ jobs:
 
           SHEET = "Broadcast_Data"
 
-          # Initial test: scan the first campaign-list page.
           MAX_CAMPAIGNS = 10
 
           def number(lines, label):
@@ -93,10 +92,6 @@ jobs:
               return matches[-1]
 
           def actual_failed(text):
-              # AiSensy summary cards can display:
-              # 2%(6)
-              # Failed
-
               patterns = [
                   r"\(\s*([\d,]+)\s*\)\s*Failed\b",
                   r"\bFailed\s*\(\s*([\d,]+)\s*\)",
@@ -203,8 +198,6 @@ jobs:
                       "Invalid credit usage"
                   )
 
-              # Campaign title appears at the beginning
-              # of the campaign details page.
               campaign_name = lines[0]
 
               return {
@@ -220,6 +213,10 @@ jobs:
                   "cost": cost,
               }
 
+          # UPDATED CAMPAIGN DISCOVERY FUNCTION
+          # This version collects diagnostics instead
+          # of attempting to update Google Sheets.
+
           def discover_campaign_urls(page):
               page.goto(
                   LIST_URL,
@@ -234,75 +231,42 @@ jobs:
                       "AiSensy session has expired"
                   )
 
-              urls = []
+              print("\n--- CAMPAIGN LIST DIAGNOSTICS ---")
+              print("Current URL:", page.url)
 
-              # First try links in the campaign list.
-              links = page.locator(
-                  'a[href*="/campaigns/all/view/"]'
+              print(
+                  "Table rows:",
+                  page.locator("tbody tr").count()
               )
 
-              for i in range(links.count()):
-                  href = links.nth(i).get_attribute("href")
+              print(
+                  "Role rows:",
+                  page.locator("[role='row']").count()
+              )
 
-                  if href:
-                      urls.append(
-                          urljoin(page.url, href)
-                      )
+              print(
+                  "Links:",
+                  page.locator("a").count()
+              )
 
-              urls = list(dict.fromkeys(urls))
+              print(
+                  "Buttons:",
+                  page.locator("button").count()
+              )
 
-              # Some versions of AiSensy use clickable
-              # table rows rather than normal links.
-              if not urls:
-                  rows = page.locator(
-                      "tbody tr, [role='row']"
-                  )
+              preview = page.locator("body").inner_text()
 
-                  count = min(
-                      rows.count(),
-                      MAX_CAMPAIGNS
-                  )
+              print("\n--- CAMPAIGN LIST PREVIEW ---")
+              print(preview[:2000])
+              print("--- END PREVIEW ---")
 
-                  for i in range(count):
-                      page.goto(
-                          LIST_URL,
-                          wait_until="domcontentloaded",
-                          timeout=60000
-                      )
-
-                      page.wait_for_timeout(2000)
-
-                      rows = page.locator(
-                          "tbody tr, [role='row']"
-                      )
-
-                      if i >= rows.count():
-                          break
-
-                      row = rows.nth(i)
-
-                      try:
-                          row.click(timeout=5000)
-
-                          page.wait_for_timeout(1500)
-
-                          if "/campaigns/all/view/" in page.url:
-                              urls.append(page.url)
-
-                      except Exception:
-                          continue
-
-              urls = list(dict.fromkeys(urls))
-
-              if not urls:
-                  raise RuntimeError(
-                      "No campaign detail links found. "
-                      "AiSensy list selectors need inspection."
-                  )
-
-              return urls[:MAX_CAMPAIGNS]
+              raise RuntimeError(
+                  "Diagnostic run complete. "
+                  "Review campaign-list structure."
+              )
 
           # Connect to Google Sheets.
+
           credentials = (
               service_account.Credentials
               .from_service_account_info(
@@ -330,7 +294,6 @@ jobs:
 
           sheets = service.spreadsheets()
 
-          # Read existing campaign IDs.
           response = sheets.values().get(
               spreadsheetId=spreadsheet_id,
               range=f"'{SHEET}'!A2:A"
@@ -365,6 +328,8 @@ jobs:
 
               print("Discovering recent campaigns...")
 
+              # This function intentionally stops
+              # after printing diagnostics.
               urls = discover_campaign_urls(page)
 
               print(
@@ -428,9 +393,6 @@ jobs:
 
                   existing_ids[campaign_id] = row
                   action = "INSERT"
-
-              # Write only the required columns.
-              # Preserve column L (Cost per Message).
 
               updates.extend([
                   {
