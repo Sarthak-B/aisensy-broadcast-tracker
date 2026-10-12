@@ -1,4 +1,4 @@
-name: AiSensy Latest 5 Broadcast Dashboard
+name: Sync AiSensy Broadcasts to Google Sheets
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: aisensy-broadcast-sync
+  group: aisensy-google-sheets-sync
   cancel-in-progress: false
 
 jobs:
@@ -25,7 +25,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install playwright google-auth google-api-python-client
+          pip install playwright google-api-python-client google-auth
           python -m playwright install --with-deps chromium
 
       - name: Fetch latest 5 and rebuild Google Sheets
@@ -39,422 +39,345 @@ jobs:
           import json
           import os
           import re
-          import time
           from datetime import datetime, timezone
 
+          from playwright.sync_api import sync_playwright
           from google.oauth2 import service_account
           from googleapiclient.discovery import build
-          from playwright.sync_api import sync_playwright
 
           PROJECT_ID = "6589906ef69fc70b424e0e43"
-          BASE = f"https://www.app.aisensy.com/projects/{PROJECT_ID}"
-          LIST_URL = BASE + "/campaigns/all"
 
-          DATA_TAB = "Broadcast_Data"
-          COST_TAB = "Cost Summary"
-          DASHBOARD_TAB = "Dashboard"
+          BASE_URL = (
+              "https://www.app.aisensy.com/projects/"
+              + PROJECT_ID
+          )
 
-          MAX_CAMPAIGNS = 5
+          CAMPAIGNS_URL = BASE_URL + "/campaigns/all"
 
-          # ---------------------------------------
-          # AISENSY EXTRACTION
-          # ---------------------------------------
+          LIMIT = 5
 
-          def field_after(lines, label):
-              for i, line in enumerate(lines[:-1]):
-                  if line.lower() == label.lower():
-                      return lines[i + 1]
-              return ""
+          REQUIRED_SECRETS = [
+              "AISENSY_SESSION",
+              "GOOGLE_SERVICE_ACCOUNT_JSON",
+              "GOOGLE_SHEET_ID",
+          ]
 
-          def metric(lines, label):
-              values = []
-
-              for i, line in enumerate(lines[:-1]):
-                  if line.lower() != label.lower():
-                      continue
-
-                  value = lines[i + 1]
-
-                  if re.fullmatch(r"[\d,]+", value):
-                      values.append(
-                          int(value.replace(",", ""))
-                      )
-
-              if not values:
-                  raise ValueError(
-                      f"Missing metric: {label}"
-                  )
-
-              return values[-1]
-
-          def actual_cost(lines):
-              for i, line in enumerate(lines[:-1]):
-                  if line != "Total Credit Usage":
-                      continue
-
-                  match = re.fullmatch(
-                      r"₹\s*([\d,]+(?:\.\d+)?)",
-                      lines[i + 1]
-                  )
-
-                  if match:
-                      return float(
-                          match.group(1).replace(",", "")
-                      )
-
-              raise ValueError(
-                  "Total Credit Usage not found"
-              )
-
-          def actual_failed(text):
-              patterns = [
-                  r"\(\s*([\d,]+)\s*\)\s*Failed\b",
-                  r"\bFailed\s*\(\s*([\d,]+)\s*\)",
-                  r"\bFailed\s*\n\s*([\d,]+)\s*(?:\n|$)"
-              ]
-
-              for pattern in patterns:
-                  match = re.search(
-                      pattern,
-                      text,
-                      re.IGNORECASE
-                  )
-
-                  if match:
-                      return int(
-                          match.group(1).replace(",", "")
-                      )
-
-              raise ValueError(
-                  "Actual Failed count not found"
-              )
-
-          def campaign_date(lines):
-              value = field_after(
-                  lines,
-                  "Created At"
-              )
-
-              if not value:
-                  return ""
-
-              try:
-                  return datetime.strptime(
-                      value,
-                      "%b %d, %Y, %I:%M %p"
-                  ).strftime("%Y-%m-%d")
-
-              except ValueError:
-                  return ""
-
-          def discover_campaign_names(page):
-              page.goto(
-                  LIST_URL,
-                  wait_until="domcontentloaded",
-                  timeout=60000
-              )
-
-              page.get_by_text(
-                  "Rows per page:",
-                  exact=False
-              ).first.wait_for(timeout=30000)
-
-              pattern = re.compile(
-                  r"(?m)^([^\n]+)\n"
-                  r"BROADCAST\n\n?"
-                  r"([A-Za-z]{3} \d{1,2}, \d{4}, "
-                  r"\d{1,2}:\d{2} [AP]M)"
-              )
-
-              names = []
-
-              for attempt in range(30):
-                  text = page.locator(
-                      "body"
-                  ).inner_text()
-
-                  names = []
-
-                  for match in pattern.finditer(text):
-                      name = match.group(1).strip()
-
-                      if name and name not in names:
-                          names.append(name)
-
-                  if len(names) >= MAX_CAMPAIGNS:
-                      break
-
-                  page.wait_for_timeout(500)
-
-              if len(names) < MAX_CAMPAIGNS:
+          for secret_name in REQUIRED_SECRETS:
+              if not os.environ.get(secret_name):
                   raise RuntimeError(
-                      f"Expected 5 campaigns, "
-                      f"found only {len(names)}. "
-                      "Spreadsheet will not be cleared."
+                      "Missing GitHub secret or variable: "
+                      + secret_name
                   )
 
-              names = names[:MAX_CAMPAIGNS]
-
-              print(
-                  "Latest campaigns: "
-                  + ", ".join(names),
-                  flush=True
-              )
-
-              return names
-
-          def open_campaign(page, name):
-              page.goto(
-                  LIST_URL,
-                  wait_until="domcontentloaded",
-                  timeout=60000
-              )
-
-              target = page.get_by_text(
-                  name,
-                  exact=True
-              ).first
-
-              target.wait_for(timeout=30000)
-              target.click(timeout=15000)
-
-              page.wait_for_url(
-                  re.compile(
-                      r"/campaigns/all/view/[^/]+"
-                  ),
-                  timeout=20000
-              )
-
-              return page.url
-
-          def extract_campaign(page, url, name):
-              page.goto(
-                  url,
-                  wait_until="domcontentloaded",
-                  timeout=60000
-              )
-
-              page.get_by_text(
-                  "Total Credit Usage",
-                  exact=True
-              ).first.wait_for(timeout=30000)
-
-              page.wait_for_timeout(1000)
-
-              text = page.locator(
-                  "body"
-              ).inner_text()
-
-              lines = [
-                  line.strip()
-                  for line in text.splitlines()
-                  if line.strip()
-              ]
-
-              campaign_type = field_after(
-                  lines,
-                  "Campaign Type"
-              ).upper()
-
-              if campaign_type != "BROADCAST":
-                  raise ValueError(
-                      "Campaign is not BROADCAST"
-                  )
-
-              audience = metric(
-                  lines,
-                  "Audience"
-              )
-
-              sent = metric(
-                  lines,
-                  "Sent"
-              )
-
-              delivered = metric(
-                  lines,
-                  "Delivered"
-              )
-
-              read = metric(
-                  lines,
-                  "Read"
-              )
-
-              failed = actual_failed(text)
-              cost = actual_cost(lines)
-
-              if not (
-                  audience >= sent >= delivered >= 0
-              ):
-                  raise ValueError(
-                      "Invalid audience/sent/delivered"
-                  )
-
-              if not 0 <= read <= delivered:
-                  raise ValueError(
-                      "Invalid read count"
-                  )
-
-              if not 0 <= failed <= audience:
-                  raise ValueError(
-                      "Invalid failed count"
-                  )
-
-              if cost < 0:
-                  raise ValueError(
-                      "Invalid cost"
-                  )
-
-              return {
-                  "id": url.rstrip("/").split("/")[-1],
-                  "name": name,
-                  "date": campaign_date(lines),
-                  "type": campaign_type,
-                  "audience": audience,
-                  "sent": sent,
-                  "delivered": delivered,
-                  "read": read,
-                  "failed": failed,
-                  "cost": cost
-              }
-
-          # ---------------------------------------
-          # FETCH AND VALIDATE ALL FIVE FIRST
-          # ---------------------------------------
-
-          state = json.loads(
+          session = json.loads(
               os.environ["AISENSY_SESSION"]
           )
 
-          campaigns = []
+          google_credentials = json.loads(
+              os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+          )
 
-          with sync_playwright() as p:
-              browser = p.chromium.launch(
-                  headless=True
-              )
+          sheet_id = os.environ["GOOGLE_SHEET_ID"]
 
-              context = browser.new_context(
-                  storage_state=state
-              )
-
-              page = context.new_page()
-
-              names = discover_campaign_names(
-                  page
-              )
-
-              for index, name in enumerate(
-                  names,
-                  start=1
-              ):
-                  print(
-                      f"[{index}/5] Fetching {name}",
-                      flush=True
-                  )
-
-                  url = open_campaign(
-                      page,
-                      name
-                  )
-
-                  campaign = extract_campaign(
-                      page,
-                      url,
-                      name
-                  )
-
-                  campaigns.append(campaign)
-
-                  print(
-                      f"OK: {name} | "
-                      f"Sent={campaign['sent']} | "
-                      f"Delivered={campaign['delivered']} | "
-                      f"Read={campaign['read']} | "
-                      f"Failed={campaign['failed']} | "
-                      f"INR {campaign['cost']}",
-                      flush=True
-                  )
-
-              browser.close()
-
-          if len(campaigns) != MAX_CAMPAIGNS:
-              raise RuntimeError(
-                  "Could not extract all five campaigns. "
-                  "Existing Google Sheets data preserved."
-              )
-
-          ids = [c["id"] for c in campaigns]
-
-          if len(set(ids)) != MAX_CAMPAIGNS:
-              raise RuntimeError(
-                  "Duplicate campaign IDs detected. "
-                  "Existing data preserved."
-              )
-
-          # ---------------------------------------
-          # CONNECT GOOGLE SHEETS
-          # ---------------------------------------
-
-          credentials = (
-              service_account.Credentials
-              .from_service_account_info(
-                  json.loads(
-                      os.environ[
-                          "GOOGLE_SERVICE_ACCOUNT_JSON"
-                      ]
-                  ),
-                  scopes=[
-                      "https://www.googleapis.com/auth/spreadsheets"
-                  ]
-              )
+          credentials = service_account.Credentials.from_service_account_info(
+              google_credentials,
+              scopes=[
+                  "https://www.googleapis.com/auth/spreadsheets"
+              ],
           )
 
           service = build(
               "sheets",
               "v4",
               credentials=credentials,
-              cache_discovery=False
+              cache_discovery=False,
           )
 
-          spreadsheet_id = os.environ[
-              "GOOGLE_SHEET_ID"
-          ]
+          sheets_api = service.spreadsheets()
 
-          sheets = service.spreadsheets()
+          now = datetime.now(timezone.utc).isoformat()
 
-          # Check all three tabs exist before clearing.
-          metadata = sheets.get(
-              spreadsheetId=spreadsheet_id
-          ).execute()
+          def metric(text, label):
+              match = re.search(
+                  rf"(?mi)^\s*{re.escape(label)}\s*\n\s*([\d,]+)\s*$",
+                  text,
+              )
 
-          sheet_ids = {
-              sheet["properties"]["title"]:
-              sheet["properties"]["sheetId"]
-              for sheet in metadata["sheets"]
-          }
-
-          required_tabs = [
-              DATA_TAB,
-              COST_TAB,
-              DASHBOARD_TAB
-          ]
-
-          for tab in required_tabs:
-              if tab not in sheet_ids:
-                  raise RuntimeError(
-                      f"Missing Google Sheets tab: {tab}"
+              if match:
+                  return int(
+                      match.group(1).replace(",", "")
                   )
 
-          # ---------------------------------------
-          # BUILD BROADCAST_DATA
-          # ---------------------------------------
+              return None
 
-          timestamp = datetime.now(
-              timezone.utc
-          ).isoformat()
+          def actual_cost(text):
+              match = re.search(
+                  r"Total Credit Usage\s*\n\s*₹\s*([\d,]+(?:\.\d+)?)",
+                  text,
+                  re.IGNORECASE,
+              )
 
-          data_values = [[
+              if match:
+                  return float(
+                      match.group(1).replace(",", "")
+                  )
+
+              return None
+
+          def failed_count(text):
+              match = re.search(
+                  r"(?i)(?:\d+(?:\.\d+)?%\s*)?"
+                  r"\(\s*([\d,]+)\s*\)\s*Failed\b",
+                  text,
+              )
+
+              if match:
+                  return int(
+                      match.group(1).replace(",", "")
+                  )
+
+              return metric(text, "Failed")
+
+          def get_campaign_names(page):
+              page.goto(
+                  CAMPAIGNS_URL,
+                  wait_until="domcontentloaded",
+                  timeout=60000,
+              )
+
+              page.get_by_text(
+                  "Rows per page:",
+                  exact=False,
+              ).wait_for(timeout=45000)
+
+              body = page.locator("body").inner_text()
+
+              if "Campaign" not in body:
+                  raise RuntimeError(
+                      "AiSensy campaign list did not load."
+                  )
+
+              # Read the rendered campaign-list text.
+              # AiSensy uses clickable elements rather than
+              # ordinary HTML table links.
+
+              lines = [
+                  line.strip()
+                  for line in body.splitlines()
+                  if line.strip()
+              ]
+
+              names = []
+
+              for index, line in enumerate(lines):
+                  if line.upper() != "BROADCAST":
+                      continue
+
+                  if index == 0:
+                      continue
+
+                  name = lines[index - 1]
+
+                  if name in (
+                      "Campaign",
+                      "Type",
+                      "Broadcast",
+                      "BROADCAST",
+                  ):
+                      continue
+
+                  if name not in names:
+                      names.append(name)
+
+                  if len(names) >= LIMIT:
+                      break
+
+              if len(names) < LIMIT:
+                  raise RuntimeError(
+                      "Only found "
+                      + str(len(names))
+                      + " broadcast names. "
+                      + "Expected 5. Existing sheet data preserved."
+                  )
+
+              print(
+                  "Discovered latest broadcasts:",
+                  ", ".join(names),
+              )
+
+              return names
+
+          def open_campaign(page, name):
+              page.goto(
+                  CAMPAIGNS_URL,
+                  wait_until="domcontentloaded",
+                  timeout=60000,
+              )
+
+              page.get_by_text(
+                  "Rows per page:",
+                  exact=False,
+              ).wait_for(timeout=45000)
+
+              # Select the exact campaign name, not a
+              # partial match against another campaign.
+
+              campaign = page.get_by_text(
+                  name,
+                  exact=True,
+              ).first
+
+              campaign.wait_for(timeout=20000)
+
+              campaign.click(timeout=20000)
+
+              page.wait_for_url(
+                  re.compile(
+                      r"/campaigns/all/view/[^/?#]+"
+                  ),
+                  timeout=30000,
+              )
+
+              page.get_by_text(
+                  "Total Credit Usage",
+                  exact=True,
+              ).first.wait_for(timeout=30000)
+
+              return page.url
+
+          def extract_campaign(page, name):
+              url = open_campaign(page, name)
+
+              campaign_id = url.rstrip("/").split("/")[-1]
+
+              body = page.locator("body").inner_text()
+
+              audience = metric(body, "Audience")
+              sent = metric(body, "Sent")
+              delivered = metric(body, "Delivered")
+              read = metric(body, "Read")
+              failed = failed_count(body)
+              cost = actual_cost(body)
+
+              required = {
+                  "Audience": audience,
+                  "Sent": sent,
+                  "Delivered": delivered,
+                  "Read": read,
+                  "Failed": failed,
+                  "Actual Cost": cost,
+              }
+
+              missing = [
+                  key
+                  for key, value in required.items()
+                  if value is None
+              ]
+
+              if missing:
+                  raise RuntimeError(
+                      "Missing analytics for "
+                      + name
+                      + ": "
+                      + ", ".join(missing)
+                      + ". Existing sheet data preserved."
+                  )
+
+              date_match = re.search(
+                  r"Created At\s*\n\s*"
+                  r"([A-Za-z]{3}\s+\d{1,2},\s+\d{4})",
+                  body,
+              )
+
+              if date_match:
+                  date_value = datetime.strptime(
+                      date_match.group(1),
+                      "%b %d, %Y",
+                  ).strftime("%Y-%m-%d")
+              else:
+                  raise RuntimeError(
+                      "Campaign date missing for "
+                      + name
+                  )
+
+              campaign_type = "BROADCAST"
+
+              row = {
+                  "id": campaign_id,
+                  "name": name,
+                  "date": date_value,
+                  "type": campaign_type,
+                  "audience": audience,
+                  "sent": sent,
+                  "delivered": delivered,
+                  "read": read,
+                  "failed": failed,
+                  "cost": cost,
+              }
+
+              print(
+                  name,
+                  "| sent:", sent,
+                  "| delivered:", delivered,
+                  "| read:", read,
+                  "| failed:", failed,
+                  "| INR:", cost,
+              )
+
+              return row
+
+          # ----------------------------------------
+          # STEP 1: FETCH AND VALIDATE ALL 5
+          # ----------------------------------------
+
+          campaigns = []
+
+          with sync_playwright() as playwright:
+              browser = playwright.chromium.launch(
+                  headless=True
+              )
+
+              context = browser.new_context(
+                  storage_state=session
+              )
+
+              page = context.new_page()
+
+              try:
+                  names = get_campaign_names(page)
+
+                  for name in names:
+                      campaigns.append(
+                          extract_campaign(page, name)
+                      )
+
+              finally:
+                  browser.close()
+
+          if len(campaigns) != LIMIT:
+              raise RuntimeError(
+                  "Expected exactly 5 campaigns. "
+                  "Existing sheet data preserved."
+              )
+
+          campaign_ids = [
+              item["id"]
+              for item in campaigns
+          ]
+
+          if len(set(campaign_ids)) != LIMIT:
+              raise RuntimeError(
+                  "Duplicate campaign IDs detected. "
+                  "Existing sheet data preserved."
+              )
+
+          print("Successfully fetched all 5 campaigns.")
+
+          # ----------------------------------------
+          # STEP 2: BUILD BROADCAST_DATA
+          # ----------------------------------------
+
+          broadcast_headers = [
               "Campaign ID",
               "Campaign Name",
               "Date",
@@ -469,433 +392,390 @@ jobs:
               "Cost per Message",
               "Estimated Cost",
               "Actual Cost",
-              "Last Updated"
-          ]]
+              "Last Updated",
+          ]
 
-          for index, c in enumerate(
-              campaigns,
-              start=2
-          ):
-              data_values.append([
-                  c["id"],
-                  c["name"],
-                  c["date"],
-                  c["type"],
-                  c["audience"],
-                  c["sent"],
-                  c["delivered"],
-                  c["read"],
-                  c["failed"],
-                  f"=IFERROR(G{index}/F{index},0)",
-                  f"=IFERROR(H{index}/G{index},0)",
+          broadcast_rows = [
+              broadcast_headers
+          ]
+
+          for item in campaigns:
+              sent = item["sent"]
+              delivered = item["delivered"]
+              read = item["read"]
+
+              delivery_rate = (
+                  delivered / sent
+                  if sent
+                  else 0
+              )
+
+              read_rate = (
+                  read / delivered
+                  if delivered
+                  else 0
+              )
+
+              broadcast_rows.append([
+                  item["id"],
+                  item["name"],
+                  item["date"],
+                  item["type"],
+                  item["audience"],
+                  sent,
+                  delivered,
+                  read,
+                  item["failed"],
+                  delivery_rate,
+                  read_rate,
                   "",
-                  (
-                      f'=IF(OR(G{index}="",'
-                      f'L{index}=""),"",'
-                      f'G{index}*L{index})'
-                  ),
-                  c["cost"],
-                  timestamp
+                  "",
+                  item["cost"],
+                  now,
               ])
 
-          # ---------------------------------------
-          # BUILD INDIVIDUAL COST SUMMARY
-          # ---------------------------------------
+          # ----------------------------------------
+          # STEP 3: BUILD COST SUMMARY
+          # ----------------------------------------
 
-          cost_values = [[
-              "Campaign Name",
-              "Date",
-              "Audience",
-              "Sent",
-              "Delivered",
-              "Read",
-              "Failed",
-              "Delivery Rate",
-              "Read Rate",
-              "Actual Cost (INR)",
-              "Cost per Delivered Message"
-          ]]
+          total_sent = sum(
+              item["sent"]
+              for item in campaigns
+          )
 
-          for index, c in enumerate(
-              campaigns,
-              start=2
-          ):
-              cost_values.append([
-                  c["name"],
-                  c["date"],
-                  c["audience"],
-                  c["sent"],
-                  c["delivered"],
-                  c["read"],
-                  c["failed"],
-                  (
-                      f"=IFERROR("
-                      f"E{index}/D{index},0)"
-                  ),
-                  (
-                      f"=IFERROR("
-                      f"F{index}/E{index},0)"
-                  ),
-                  c["cost"],
-                  (
-                      f"=IFERROR("
-                      f"J{index}/E{index},0)"
-                  )
-              ])
+          total_delivered = sum(
+              item["delivered"]
+              for item in campaigns
+          )
 
-          # Add totals after the five campaigns.
-          cost_values.append([
-              "TOTAL",
-              "",
-              "=SUM(C2:C6)",
-              "=SUM(D2:D6)",
-              "=SUM(E2:E6)",
-              "=SUM(F2:F6)",
-              "=SUM(G2:G6)",
-              "=IFERROR(E7/D7,0)",
-              "=IFERROR(F7/E7,0)",
-              "=SUM(J2:J6)",
-              "=IFERROR(J7/E7,0)"
-          ])
+          total_read = sum(
+              item["read"]
+              for item in campaigns
+          )
 
-          # ---------------------------------------
-          # BUILD DASHBOARD
-          # ---------------------------------------
+          total_failed = sum(
+              item["failed"]
+              for item in campaigns
+          )
 
-          dashboard_values = [
+          total_audience = sum(
+              item["audience"]
+              for item in campaigns
+          )
+
+          total_cost = sum(
+              item["cost"]
+              for item in campaigns
+          )
+
+          cost_rows = [
               [
-                  "AISENSY BROADCAST DASHBOARD",
-                  ""
-              ],
-              [
-                  "Broadcasts Tracked",
-                  "=COUNTA(Broadcast_Data!A2:A6)"
-              ],
-              [
-                  "Messages Sent",
-                  "=SUM(Broadcast_Data!F2:F6)"
-              ],
-              [
-                  "Messages Delivered",
-                  "=SUM(Broadcast_Data!G2:G6)"
-              ],
-              [
-                  "Messages Read",
-                  "=SUM(Broadcast_Data!H2:H6)"
-              ],
-              [
-                  "Messages Failed",
-                  "=SUM(Broadcast_Data!I2:I6)"
-              ],
-              [
-                  "Total Actual Cost (INR)",
-                  "=SUM(Broadcast_Data!N2:N6)"
-              ],
-              [
-                  "Delivery Rate",
-                  "=IFERROR(B4/B3,0)"
-              ],
-              [
-                  "Read Rate",
-                  "=IFERROR(B5/B4,0)"
-              ],
-              [
-                  "Average Cost per Campaign",
-                  "=IFERROR(B7/B2,0)"
-              ],
-              [
-                  "Cost per Delivered Message",
-                  "=IFERROR(B7/B4,0)"
-              ],
-              [
-                  "Last Refresh",
-                  datetime.now(
-                      timezone.utc
-                  ).strftime(
-                      "%Y-%m-%d %H:%M UTC"
-                  )
+                  "Campaign Name",
+                  "Date",
+                  "Audience",
+                  "Sent",
+                  "Delivered",
+                  "Read",
+                  "Failed",
+                  "Actual Cost (INR)",
+                  "Cost per Sent Message",
               ]
           ]
 
-          dashboard_campaigns = [[
-              "Campaign Name",
-              "Sent",
-              "Delivered",
-              "Read",
-              "Failed",
-              "Actual Cost (INR)",
-              "Delivery Rate"
-          ]]
-
-          for index, c in enumerate(
-              campaigns,
-              start=2
-          ):
-              dashboard_campaigns.append([
-                  c["name"],
-                  c["sent"],
-                  c["delivered"],
-                  c["read"],
-                  c["failed"],
-                  c["cost"],
-                  (
-                      f"=IFERROR("
-                      f"F{index}/E{index},0)"
-                  )
-              ])
-
-          # Fix dashboard delivery rate formula
-          # to reference the dashboard comparison
-          # table's Sent and Delivered columns.
-          for index in range(
-              1,
-              len(dashboard_campaigns)
-          ):
-              row = index + 2
-
-              dashboard_campaigns[index][6] = (
-                  f"=IFERROR(F{row}/E{row},0)"
+          for item in campaigns:
+              cost_per_sent = (
+                  item["cost"] / item["sent"]
+                  if item["sent"]
+                  else 0
               )
 
-          # ---------------------------------------
-          # CLEAR ALL OLD CONTENTS
-          # ---------------------------------------
-          #
-          # This happens only AFTER all five
-          # campaigns have been extracted.
-          # ---------------------------------------
+              cost_rows.append([
+                  item["name"],
+                  item["date"],
+                  item["audience"],
+                  item["sent"],
+                  item["delivered"],
+                  item["read"],
+                  item["failed"],
+                  item["cost"],
+                  cost_per_sent,
+              ])
 
-          print(
-              "All 5 campaigns validated. "
-              "Replacing old reporting data...",
-              flush=True
+          cost_rows.append([
+              "TOTAL",
+              "",
+              total_audience,
+              total_sent,
+              total_delivered,
+              total_read,
+              total_failed,
+              total_cost,
+              (
+                  total_cost / total_sent
+                  if total_sent
+                  else 0
+              ),
+          ])
+
+          # ----------------------------------------
+          # STEP 4: BUILD DASHBOARD
+          # ----------------------------------------
+
+          delivery_rate = (
+              total_delivered / total_sent
+              if total_sent
+              else 0
           )
 
-          sheets.values().batchClear(
-              spreadsheetId=spreadsheet_id,
-              body={
-                  "ranges": [
-                      f"'{DATA_TAB}'!A:O",
-                      f"'{COST_TAB}'!A:K",
-                      f"'{DASHBOARD_TAB}'!A:K"
-                  ]
-              }
+          read_rate = (
+              total_read / total_delivered
+              if total_delivered
+              else 0
+          )
+
+          dashboard_rows = [
+              ["Metric", "Value"],
+              ["Total Broadcasts", LIMIT],
+              ["Total Audience", total_audience],
+              ["Total Messages Sent", total_sent],
+              ["Total Messages Delivered", total_delivered],
+              ["Total Messages Read", total_read],
+              ["Total Messages Failed", total_failed],
+              ["Total Actual Cost (INR)", total_cost],
+              ["Overall Delivery Rate", delivery_rate],
+              ["Overall Read Rate", read_rate],
+              ["Last Updated (UTC)", now],
+              [],
+              ["LATEST 5 BROADCASTS"],
+              [
+                  "Campaign",
+                  "Sent",
+                  "Delivered",
+                  "Read",
+                  "Failed",
+                  "Cost (INR)",
+              ],
+          ]
+
+          for item in campaigns:
+              dashboard_rows.append([
+                  item["name"],
+                  item["sent"],
+                  item["delivered"],
+                  item["read"],
+                  item["failed"],
+                  item["cost"],
+              ])
+
+          # ----------------------------------------
+          # STEP 5: CHECK GOOGLE SHEETS TABS
+          # ----------------------------------------
+
+          metadata = sheets_api.get(
+              spreadsheetId=sheet_id,
+              fields="sheets(properties(sheetId,title))",
           ).execute()
 
-          # ---------------------------------------
-          # WRITE ALL THREE TABS
-          # ---------------------------------------
+          tabs = {
+              sheet["properties"]["title"]:
+              sheet["properties"]["sheetId"]
+              for sheet in metadata["sheets"]
+          }
 
-          sheets.values().batchUpdate(
-              spreadsheetId=spreadsheet_id,
+          required_tabs = [
+              "Broadcast_Data",
+              "Cost Summary",
+              "Dashboard",
+          ]
+
+          for tab in required_tabs:
+              if tab not in tabs:
+                  raise RuntimeError(
+                      "Missing Google Sheets tab: "
+                      + tab
+                      + ". Existing data preserved."
+                  )
+
+          # ----------------------------------------
+          # STEP 6: REPLACE OLD DATA
+          # ----------------------------------------
+
+          # All 5 campaigns were fetched successfully
+          # before reaching this point.
+
+          clear_ranges = [
+              "'Broadcast_Data'!A:O",
+              "'Cost Summary'!A:I",
+              "'Dashboard'!A:K",
+          ]
+
+          sheets_api.values().batchClear(
+              spreadsheetId=sheet_id,
               body={
-                  "valueInputOption": "USER_ENTERED",
+                  "ranges": clear_ranges
+              },
+          ).execute()
+
+          sheets_api.values().batchUpdate(
+              spreadsheetId=sheet_id,
+              body={
+                  "valueInputOption": "RAW",
                   "data": [
                       {
-                          "range": (
-                              f"'{DATA_TAB}'!A1:O6"
-                          ),
-                          "values": data_values
+                          "range": "'Broadcast_Data'!A1",
+                          "values": broadcast_rows,
                       },
                       {
-                          "range": (
-                              f"'{COST_TAB}'!A1:K7"
-                          ),
-                          "values": cost_values
+                          "range": "'Cost Summary'!A1",
+                          "values": cost_rows,
                       },
                       {
-                          "range": (
-                              f"'{DASHBOARD_TAB}'!A1:B12"
-                          ),
-                          "values": dashboard_values
+                          "range": "'Dashboard'!A1",
+                          "values": dashboard_rows,
                       },
-                      {
-                          "range": (
-                              f"'{DASHBOARD_TAB}'!D2:J7"
-                          ),
-                          "values": dashboard_campaigns
-                      }
-                  ]
-              }
+                  ],
+              },
           ).execute()
 
-          # ---------------------------------------
-          # FORMAT REPORTS
-          # ---------------------------------------
+          # ----------------------------------------
+          # STEP 7: APPLY NUMBER FORMATTING
+          # ----------------------------------------
 
-          requests = []
-
-          def grid_range(tab, start_row, end_row,
-                         start_col, end_col):
-              return {
-                  "sheetId": sheet_ids[tab],
-                  "startRowIndex": start_row,
-                  "endRowIndex": end_row,
-                  "startColumnIndex": start_col,
-                  "endColumnIndex": end_col
-              }
-
-          def number_format(
+          def format_range(
               tab,
               start_row,
               end_row,
               start_col,
               end_col,
-              format_type,
-              pattern
+              number_type,
+              pattern,
           ):
-              requests.append({
+              return {
                   "repeatCell": {
-                      "range": grid_range(
-                          tab,
-                          start_row,
-                          end_row,
-                          start_col,
-                          end_col
-                      ),
+                      "range": {
+                          "sheetId": tabs[tab],
+                          "startRowIndex": start_row,
+                          "endRowIndex": end_row,
+                          "startColumnIndex": start_col,
+                          "endColumnIndex": end_col,
+                      },
                       "cell": {
                           "userEnteredFormat": {
                               "numberFormat": {
-                                  "type": format_type,
-                                  "pattern": pattern
+                                  "type": number_type,
+                                  "pattern": pattern,
                               }
                           }
                       },
                       "fields": (
                           "userEnteredFormat.numberFormat"
-                      )
-                  }
-              })
-
-          # Percentages
-          number_format(
-              DATA_TAB, 1, 6, 9, 11,
-              "PERCENT", "0.00%"
-          )
-
-          number_format(
-              COST_TAB, 1, 7, 7, 9,
-              "PERCENT", "0.00%"
-          )
-
-          number_format(
-              DASHBOARD_TAB, 7, 9, 1, 2,
-              "PERCENT", "0.00%"
-          )
-
-          number_format(
-              DASHBOARD_TAB, 2, 7, 9, 10,
-              "PERCENT", "0.00%"
-          )
-
-          # Currency
-          for tab, sr, er, sc, ec in [
-              (DATA_TAB, 1, 6, 13, 14),
-              (COST_TAB, 1, 7, 9, 11),
-              (DASHBOARD_TAB, 6, 7, 1, 2),
-              (DASHBOARD_TAB, 9, 11, 1, 2),
-              (DASHBOARD_TAB, 2, 7, 8, 9)
-          ]:
-              number_format(
-                  tab, sr, er, sc, ec,
-                  "CURRENCY",
-                  '₹#,##0.00'
-              )
-
-          # Bold headers
-          for tab, row_start, row_end,
-              col_start, col_end in [
-                  (DATA_TAB, 0, 1, 0, 15),
-                  (COST_TAB, 0, 1, 0, 11),
-                  (DASHBOARD_TAB, 0, 1, 0, 2),
-                  (DASHBOARD_TAB, 1, 2, 3, 10)
-              ]:
-              requests.append({
-                  "repeatCell": {
-                      "range": grid_range(
-                          tab,
-                          row_start,
-                          row_end,
-                          col_start,
-                          col_end
                       ),
-                      "cell": {
-                          "userEnteredFormat": {
-                              "textFormat": {
-                                  "bold": True
-                              }
-                          }
-                      },
-                      "fields": (
-                          "userEnteredFormat.textFormat.bold"
-                      )
                   }
-              })
-
-          # Freeze headers
-          for tab in [
-              DATA_TAB,
-              COST_TAB
-          ]:
-              requests.append({
-                  "updateSheetProperties": {
-                      "properties": {
-                          "sheetId": sheet_ids[tab],
-                          "gridProperties": {
-                              "frozenRowCount": 1
-                          }
-                      },
-                      "fields": (
-                          "gridProperties.frozenRowCount"
-                      )
-                  }
-              })
-
-          # Auto-size columns
-          for tab, end_col in [
-              (DATA_TAB, 15),
-              (COST_TAB, 11),
-              (DASHBOARD_TAB, 10)
-          ]:
-              requests.append({
-                  "autoResizeDimensions": {
-                      "dimensions": {
-                          "sheetId": sheet_ids[tab],
-                          "dimension": "COLUMNS",
-                          "startIndex": 0,
-                          "endIndex": end_col
-                      }
-                  }
-              })
-
-          sheets.batchUpdate(
-              spreadsheetId=spreadsheet_id,
-              body={
-                  "requests": requests
               }
+
+          formatting_requests = []
+
+          formatting_requests.append(
+              format_range(
+                  "Broadcast_Data",
+                  1, 6, 9, 11,
+                  "PERCENT",
+                  "0.00%",
+              )
+          )
+
+          formatting_requests.append(
+              format_range(
+                  "Broadcast_Data",
+                  1, 6, 13, 14,
+                  "CURRENCY",
+                  '"₹"#,##0.00',
+              )
+          )
+
+          formatting_requests.append(
+              format_range(
+                  "Cost Summary",
+                  1, 7, 7, 9,
+                  "CURRENCY",
+                  '"₹"#,##0.00',
+              )
+          )
+
+          formatting_requests.append(
+              format_range(
+                  "Dashboard",
+                  8, 10, 1, 2,
+                  "PERCENT",
+                  "0.00%",
+              )
+          )
+
+          formatting_requests.append(
+              format_range(
+                  "Dashboard",
+                  7, 8, 1, 2,
+                  "CURRENCY",
+                  '"₹"#,##0.00',
+              )
+          )
+
+          formatting_requests.append(
+              format_range(
+                  "Dashboard",
+                  14, 19, 5, 6,
+                  "CURRENCY",
+                  '"₹"#,##0.00',
+              )
+          )
+
+          # Bold headers in each tab.
+
+          for tab, header_rows in [
+              ("Broadcast_Data", [0]),
+              ("Cost Summary", [0, 6]),
+              ("Dashboard", [0, 12, 13]),
+          ]:
+              for header_row in header_rows:
+                  formatting_requests.append({
+                      "repeatCell": {
+                          "range": {
+                              "sheetId": tabs[tab],
+                              "startRowIndex": header_row,
+                              "endRowIndex": header_row + 1,
+                          },
+                          "cell": {
+                              "userEnteredFormat": {
+                                  "textFormat": {
+                                      "bold": True
+                                  }
+                              }
+                          },
+                          "fields": (
+                              "userEnteredFormat.textFormat.bold"
+                          ),
+                      }
+                  })
+
+          sheets_api.batchUpdate(
+              spreadsheetId=sheet_id,
+              body={
+                  "requests": formatting_requests
+              },
           ).execute()
 
-          print(
-              "SUCCESS: Only latest 5 campaigns "
-              "are now in Google Sheets.",
-              flush=True
-          )
-
-          print(
-              "Cost Summary: 5 individual campaigns "
-              "plus totals.",
-              flush=True
-          )
-
-          print(
-              "Dashboard: KPIs and campaign "
-              "comparison populated.",
-              flush=True
-          )
-
-          print(
-              "Next automatic run: "
-              "every 2 hours (UTC cron).",
-              flush=True
-          )
+          print("----------------------------------")
+          print("GOOGLE SHEETS UPDATED SUCCESSFULLY")
+          print("----------------------------------")
+          print("Broadcasts:", len(campaigns))
+          print("Total sent:", total_sent)
+          print("Total delivered:", total_delivered)
+          print("Total read:", total_read)
+          print("Total failed:", total_failed)
+          print("Total actual cost: INR", round(total_cost, 3))
+          print("Updated tabs:")
+          print("- Broadcast_Data")
+          print("- Cost Summary")
+          print("- Dashboard")
+          print("----------------------------------")
           PY
