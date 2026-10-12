@@ -29,47 +29,37 @@ jobs:
           import os
           import re
           from datetime import datetime, timezone
-          from urllib.parse import urljoin
 
           from google.oauth2 import service_account
           from googleapiclient.discovery import build
           from playwright.sync_api import sync_playwright
 
           PROJECT_ID = "6589906ef69fc70b424e0e43"
-
-          BASE = (
-              "https://www.app.aisensy.com/projects/"
-              + PROJECT_ID
-          )
-
+          BASE = f"https://www.app.aisensy.com/projects/{PROJECT_ID}"
           LIST_URL = BASE + "/campaigns/all"
-
           SHEET = "Broadcast_Data"
 
-          MAX_CAMPAIGNS = 10
+          # Test the first five campaigns before scaling up.
+          MAX_CAMPAIGNS = 5
 
-          def number(lines, label):
-              matches = []
+          def metric(lines, label):
+              values = []
 
               for i, line in enumerate(lines[:-1]):
                   if line.lower() == label.lower():
                       value = lines[i + 1]
 
                       if re.fullmatch(r"[\d,]+", value):
-                          matches.append(
+                          values.append(
                               int(value.replace(",", ""))
                           )
 
-              if not matches:
-                  raise ValueError(
-                      f"Missing metric: {label}"
-                  )
+              if not values:
+                  raise ValueError(f"Missing metric: {label}")
 
-              return matches[-1]
+              return values[-1]
 
           def actual_cost(lines):
-              matches = []
-
               for i, line in enumerate(lines[:-1]):
                   if line == "Total Credit Usage":
                       match = re.fullmatch(
@@ -78,18 +68,11 @@ jobs:
                       )
 
                       if match:
-                          matches.append(
-                              float(
-                                  match.group(1).replace(",", "")
-                              )
+                          return float(
+                              match.group(1).replace(",", "")
                           )
 
-              if not matches:
-                  raise ValueError(
-                      "Missing Total Credit Usage"
-                  )
-
-              return matches[-1]
+              raise ValueError("Missing Total Credit Usage")
 
           def actual_failed(text):
               patterns = [
@@ -110,9 +93,7 @@ jobs:
                           match.group(1).replace(",", "")
                       )
 
-              raise ValueError(
-                  "Could not read actual Failed count"
-              )
+              raise ValueError("Missing actual Failed count")
 
           def field_after(lines, label):
               for i, line in enumerate(lines[:-1]):
@@ -122,14 +103,14 @@ jobs:
               return ""
 
           def campaign_date(lines):
-              created = field_after(lines, "Created At")
+              value = field_after(lines, "Created At")
 
-              if not created:
+              if not value:
                   return ""
 
               try:
                   parsed = datetime.strptime(
-                      created,
+                      value,
                       "%b %d, %Y, %I:%M %p"
                   )
 
@@ -138,7 +119,94 @@ jobs:
               except ValueError:
                   return ""
 
-          def get_campaign(page, url):
+          def discover_campaigns(page):
+              page.goto(
+                  LIST_URL,
+                  wait_until="domcontentloaded",
+                  timeout=60000
+              )
+
+              page.get_by_text(
+                  "Rows per page:",
+                  exact=False
+              ).first.wait_for(timeout=30000)
+
+              page.wait_for_timeout(2000)
+
+              body = page.locator("body").inner_text()
+
+              # AiSensy's visible campaign list contains:
+              # Campaign
+              # Type
+              # Created At
+              # Status
+              # Audience
+              # campaign-name
+              # BROADCAST
+              # date
+              # Sent
+              # audience
+
+              pattern = re.compile(
+                  r"(?m)^([^\n]+)\n"
+                  r"BROADCAST\n\n?"
+                  r"([A-Za-z]{3} \d{1,2}, \d{4}, "
+                  r"\d{1,2}:\d{2} [AP]M)"
+              )
+
+              names = []
+
+              for match in pattern.finditer(body):
+                  name = match.group(1).strip()
+
+                  if name and name not in names:
+                      names.append(name)
+
+              print(
+                  f"Discovered {len(names)} broadcast names"
+              )
+
+              for name in names[:MAX_CAMPAIGNS]:
+                  print("Campaign:", name)
+
+              if not names:
+                  raise RuntimeError(
+                      "Could not identify campaign names "
+                      "from AiSensy list"
+                  )
+
+              return names[:MAX_CAMPAIGNS]
+
+          def open_campaign(page, name):
+              page.goto(
+                  LIST_URL,
+                  wait_until="domcontentloaded",
+                  timeout=60000
+              )
+
+              page.get_by_text(
+                  "Rows per page:",
+                  exact=False
+              ).first.wait_for(timeout=30000)
+
+              # Campaign names are clickable even though
+              # AiSensy does not use normal table rows.
+              campaign = page.get_by_text(
+                  name,
+                  exact=True
+              ).first
+
+              campaign.wait_for(timeout=15000)
+              campaign.click(timeout=15000)
+
+              page.wait_for_url(
+                  re.compile(r"/campaigns/all/view/[^/]+"),
+                  timeout=20000
+              )
+
+              return page.url
+
+          def extract_campaign(page, url, name):
               page.goto(
                   url,
                   wait_until="domcontentloaded",
@@ -150,7 +218,7 @@ jobs:
                   exact=True
               ).first.wait_for(timeout=30000)
 
-              page.wait_for_timeout(2000)
+              page.wait_for_timeout(1500)
 
               text = page.locator("body").inner_text()
 
@@ -161,48 +229,37 @@ jobs:
               ]
 
               campaign_type = field_after(
-                  lines, "Campaign Type"
+                  lines,
+                  "Campaign Type"
               ).upper()
 
               if campaign_type != "BROADCAST":
                   return None
 
-              campaign_id = url.rstrip("/").split("/")[-1]
-
-              audience = number(lines, "Audience")
-              sent = number(lines, "Sent")
-              delivered = number(lines, "Delivered")
-              read = number(lines, "Read")
+              audience = metric(lines, "Audience")
+              sent = metric(lines, "Sent")
+              delivered = metric(lines, "Delivered")
+              read = metric(lines, "Read")
               failed = actual_failed(text)
               cost = actual_cost(lines)
 
               if not (
                   audience >= sent >= delivered >= 0
               ):
-                  raise ValueError(
-                      "Invalid campaign statistics"
-                  )
+                  raise ValueError("Invalid message counts")
 
               if not 0 <= read <= delivered:
-                  raise ValueError(
-                      "Invalid read count"
-                  )
+                  raise ValueError("Invalid read count")
 
-              if failed > audience:
-                  raise ValueError(
-                      "Invalid failed count"
-                  )
+              if not 0 <= failed <= audience:
+                  raise ValueError("Invalid failed count")
 
               if cost < 0:
-                  raise ValueError(
-                      "Invalid credit usage"
-                  )
-
-              campaign_name = lines[0]
+                  raise ValueError("Invalid credit usage")
 
               return {
-                  "id": campaign_id,
-                  "name": campaign_name,
+                  "id": url.rstrip("/").split("/")[-1],
+                  "name": name,
                   "date": campaign_date(lines),
                   "type": campaign_type,
                   "audience": audience,
@@ -213,59 +270,63 @@ jobs:
                   "cost": cost,
               }
 
-          # UPDATED CAMPAIGN DISCOVERY FUNCTION
-          # This version collects diagnostics instead
-          # of attempting to update Google Sheets.
+          state = json.loads(
+              os.environ["AISENSY_SESSION"]
+          )
 
-          def discover_campaign_urls(page):
-              page.goto(
-                  LIST_URL,
-                  wait_until="domcontentloaded",
-                  timeout=60000
+          campaigns = []
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(
+                  headless=True
               )
 
-              page.wait_for_timeout(5000)
-
-              if "/login" in page.url:
-                  raise RuntimeError(
-                      "AiSensy session has expired"
-                  )
-
-              print("\n--- CAMPAIGN LIST DIAGNOSTICS ---")
-              print("Current URL:", page.url)
-
-              print(
-                  "Table rows:",
-                  page.locator("tbody tr").count()
+              context = browser.new_context(
+                  storage_state=state
               )
 
-              print(
-                  "Role rows:",
-                  page.locator("[role='row']").count()
-              )
+              page = context.new_page()
 
-              print(
-                  "Links:",
-                  page.locator("a").count()
-              )
+              names = discover_campaigns(page)
 
-              print(
-                  "Buttons:",
-                  page.locator("button").count()
-              )
+              for name in names:
+                  try:
+                      print(f"Opening campaign: {name}")
 
-              preview = page.locator("body").inner_text()
+                      url = open_campaign(page, name)
 
-              print("\n--- CAMPAIGN LIST PREVIEW ---")
-              print(preview[:2000])
-              print("--- END PREVIEW ---")
+                      print("Opened campaign detail page")
 
+                      data = extract_campaign(
+                          page,
+                          url,
+                          name
+                      )
+
+                      if data:
+                          campaigns.append(data)
+
+                          print(
+                              f"Extracted {name}: "
+                              f"sent={data['sent']}, "
+                              f"delivered={data['delivered']}, "
+                              f"read={data['read']}, "
+                              f"failed={data['failed']}, "
+                              f"cost=INR {data['cost']}"
+                          )
+
+                  except Exception as error:
+                      print(
+                          f"Skipped {name}: {error}"
+                      )
+
+              browser.close()
+
+          if not campaigns:
               raise RuntimeError(
-                  "Diagnostic run complete. "
-                  "Review campaign-list structure."
+                  "No campaign analytics extracted. "
+                  "Google Sheets was not modified."
               )
-
-          # Connect to Google Sheets.
 
           credentials = (
               service_account.Credentials
@@ -309,71 +370,6 @@ jobs:
 
           next_row = len(existing) + 2
 
-          state = json.loads(
-              os.environ["AISENSY_SESSION"]
-          )
-
-          campaigns = []
-
-          with sync_playwright() as p:
-              browser = p.chromium.launch(
-                  headless=True
-              )
-
-              context = browser.new_context(
-                  storage_state=state
-              )
-
-              page = context.new_page()
-
-              print("Discovering recent campaigns...")
-
-              # This function intentionally stops
-              # after printing diagnostics.
-              urls = discover_campaign_urls(page)
-
-              print(
-                  f"Found {len(urls)} campaign URLs"
-              )
-
-              for url in urls:
-                  try:
-                      campaign = get_campaign(
-                          page, url
-                      )
-
-                      if campaign is None:
-                          print(
-                              "Skipped non-broadcast campaign"
-                          )
-                          continue
-
-                      campaigns.append(campaign)
-
-                      print(
-                          "Extracted:",
-                          campaign["id"],
-                          "sent=",
-                          campaign["sent"],
-                          "cost=INR",
-                          campaign["cost"]
-                      )
-
-                  except Exception as error:
-                      print(
-                          "Skipped campaign:",
-                          url.split("/")[-1],
-                          str(error)
-                      )
-
-              browser.close()
-
-          if not campaigns:
-              raise RuntimeError(
-                  "No valid broadcast campaigns extracted. "
-                  "Google Sheets was not changed."
-              )
-
           updates = []
 
           now = datetime.now(
@@ -390,15 +386,12 @@ jobs:
               else:
                   row = next_row
                   next_row += 1
-
                   existing_ids[campaign_id] = row
                   action = "INSERT"
 
               updates.extend([
                   {
-                      "range": (
-                          f"'{SHEET}'!A{row}:I{row}"
-                      ),
+                      "range": f"'{SHEET}'!A{row}:I{row}",
                       "values": [[
                           campaign["id"],
                           campaign["name"],
@@ -412,18 +405,14 @@ jobs:
                       ]]
                   },
                   {
-                      "range": (
-                          f"'{SHEET}'!J{row}:K{row}"
-                      ),
+                      "range": f"'{SHEET}'!J{row}:K{row}",
                       "values": [[
                           f"=IFERROR(G{row}/F{row},0)",
                           f"=IFERROR(H{row}/G{row},0)"
                       ]]
                   },
                   {
-                      "range": (
-                          f"'{SHEET}'!M{row}:O{row}"
-                      ),
+                      "range": f"'{SHEET}'!M{row}:O{row}",
                       "values": [[
                           (
                               f'=IF(OR(G{row}="",'
@@ -437,7 +426,7 @@ jobs:
               ])
 
               print(
-                  f"{action}: {campaign_id} "
+                  f"{action}: {campaign['name']} "
                   f"-> row {row}"
               )
 
