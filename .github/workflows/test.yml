@@ -27,7 +27,7 @@ jobs:
           pip install playwright gspread google-auth
           python -m playwright install --with-deps chromium
 
-      - name: Refresh latest broadcasts and rotating historical batch
+      - name: Check latest sent broadcasts and add new campaigns only
         env:
           AISENSY_SESSION: ${{ secrets.AISENSY_SESSION }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
@@ -38,6 +38,7 @@ jobs:
           import json
           import os
           import re
+          import sys
           from contextlib import contextmanager
           from datetime import timedelta
           from datetime import datetime, timezone
@@ -49,8 +50,7 @@ jobs:
           PROJECT_ID = '6589906ef69fc70b424e0e43'
           LIST_URL = f'https://www.app.aisensy.com/projects/{PROJECT_ID}/campaigns/all'
           MAX_CAMPAIGNS = 5
-          HISTORICAL_BATCH_SIZE = 5
-          MAX_DISCOVERY_PAGES = 10
+          MAX_DISCOVERY_PAGES = 3
           SHEET_ID = os.environ.get('GOOGLE_SHEET_ID', '').strip() or '1jXnQPQngi-FbEBBHC0tvaOTXxmtE5_miv6Mq0rTbmLQ'
           IST = ZoneInfo('Asia/Kolkata')
 
@@ -301,7 +301,9 @@ jobs:
                   candidate = lines[index - 1]
                   if candidate.lower() in ('campaign', 'type', 'broadcast', 'status', 'audience'):
                       continue
-                  nearby = ' '.join(lines[index + 1:index + 5])
+                  nearby = ' '.join(lines[index + 1:index + 8])
+                  if not re.search(r'\bSent\b', nearby, re.I):
+                      continue
                   if not re.search(r'[A-Za-z]{3}\s+\d{1,2},\s+\d{4}', nearby):
                       continue
                   if candidate not in names:
@@ -326,14 +328,17 @@ jobs:
                       kind = str(fields.get('campaigntype') or fields.get('type') or '').upper()
                       cid = fields.get('campaignid') or fields.get('id')
                       name = fields.get('campaignname') or fields.get('name')
-                      if kind == 'BROADCAST' and isinstance(cid, str) and isinstance(name, str) and re.fullmatch(r'[A-Za-z0-9]+', cid):
-                          result[cid] = name
+                      status = str(fields.get('status') or fields.get('campaignstatus') or '').upper()
+                      if kind == 'BROADCAST' and status == 'SENT' and isinstance(cid, str) and isinstance(name, str) and re.fullmatch(r'[A-Za-z0-9]+', cid):
+                          raw_time = fields.get('sentat') or fields.get('broadcastsentat') or fields.get('createdat') or ''
+                          normalized_time = actual_sent_value(raw_time) or str(raw_time)
+                          result[cid] = (name, chronological_time(normalized_time))
                       for item in value.values():
                           if isinstance(item, (dict, list)):
                               walk(item)
               for payload in payloads:
                   walk(payload)
-              return list(result.items())
+              return [(cid, value[0], value[1]) for cid, value in sorted(result.items(), key=lambda item: (item[1][1], item[0]), reverse=True)]
 
           def next_campaign_page(page):
               locator = page.get_by_role('button', name=re.compile(r'^(?:go to |navigate to )?next(?: page)?$', re.I))
@@ -351,70 +356,71 @@ jobs:
                   return True
               return False
 
+          def latest_new_candidates(entries, saved):
+              # Unknown older IDs are backlog, not newly sent broadcasts.
+              cutoff = max((chronological_time(date_with_time(rec)) for rec in saved.values()), default=float('-inf'))
+              latest = sorted(entries, key=lambda row: (row[2], row[0]), reverse=True)[:MAX_CAMPAIGNS]
+              return [(cid, name) for cid, name, timestamp in latest
+                      if cid not in saved and (not saved or timestamp >= cutoff)]
+
           def discover_new_broadcasts(list_page, detail_page, saved):
-              fetched_new = []
-              seen_ids = set(saved)
-              saved_names = {rec['Campaign Name'] for rec in saved.values()}
-              inspected_names = set()
-              seen_pages = set()
-              attempts = 0
+              entries = {}
               list_available = False
+              fallback_rows = []
+              seen_pages = set()
               with campaign_responses(list_page) as payloads:
                   wait_for_list(list_page)
                   for page_number in range(1, MAX_DISCOVERY_PAGES + 1):
                       body = list_page.locator('body').inner_text()
-                      fingerprint = body
-                      if fingerprint in seen_pages:
+                      if body in seen_pages:
                           break
-                      seen_pages.add(fingerprint)
-                      names = extract_names(body)
-                      entries = campaign_list_records(payloads)
-                      if names or entries:
-                          list_available = True
-                      print(f'Discovery page {page_number}: {len(entries)} campaign IDs, {len(names)} broadcast names.', flush=True)
-                      # API IDs distinguish duplicate names and already-saved rows.
-                      for cid, name in entries:
-                          if cid in seen_ids:
-                              continue
-                          seen_ids.add(cid)
-                          attempts += 1
-                          try:
-                              record = fetch_campaign(detail_page, name, campaign_id=cid)
-                              if record['Campaign ID'] not in saved:
-                                  fetched_new.append(record)
-                          except Exception as exc:
-                              print(f'WARNING: New broadcast {cid} not saved; will retry next run: {exc}', flush=True)
-                          if len(fetched_new) >= MAX_CAMPAIGNS or attempts >= MAX_CAMPAIGNS * 2:
-                              return fetched_new, list_available
-                      # Fallback for list responses without campaign IDs: click
-                      # unseen names on this page, then resolve the real view ID.
+                      seen_pages.add(body)
+                      list_available = bool(re.search(r'Rows per page:', body, re.I)) or list_available
+                      for cid, name, timestamp in campaign_list_records(payloads):
+                          entries[cid] = (cid, name, timestamp)
+                      if len(entries) >= MAX_CAMPAIGNS:
+                          break
                       if not entries:
-                          for name in names:
-                              if name in saved_names or name in inspected_names:
+                          # Capture the displayed date alongside each sent row.
+                          lines = [line.strip() for line in body.splitlines() if line.strip()]
+                          for index, line in enumerate(lines):
+                              if line != 'BROADCAST' or index == 0:
                                   continue
-                              inspected_names.add(name)
-                              attempts += 1
-                              try:
-                                  target = list_page.get_by_text(name, exact=True).first
-                                  target.click(timeout=10000)
-                                  list_page.wait_for_url(re.compile(r'/campaigns/all/view/[A-Za-z0-9]+'), timeout=20000)
-                                  cid = re.search(r'/view/([A-Za-z0-9]+)', list_page.url).group(1)
-                                  if cid not in seen_ids:
-                                      seen_ids.add(cid)
-                                      fetched_new.append(fetch_campaign(detail_page, name, campaign_id=cid))
-                              except Exception as exc:
-                                  print(f'WARNING: Could not resolve new broadcast {name}; will retry next run: {exc}', flush=True)
-                              finally:
-                                  if '/view/' in list_page.url:
-                                      list_page.go_back(wait_until='domcontentloaded', timeout=20000)
-                                      list_page.get_by_text('Rows per page:', exact=False).first.wait_for(timeout=20000)
-                                      list_page.wait_for_timeout(500)
-                              if len(fetched_new) >= MAX_CAMPAIGNS or attempts >= MAX_CAMPAIGNS * 2:
-                                  return fetched_new, list_available
+                              nearby = lines[index + 1:index + 7]
+                              if not any(value.upper() == 'SENT' for value in nearby):
+                                  continue
+                              date_line = next((value for value in nearby if re.search(r'[A-Za-z]{3}\s+\d{1,2},\s+\d{4}', value)), '')
+                              timestamp = chronological_time(displayed_campaign_time('Created At\n' + date_line))
+                              fallback_rows.append((lines[index - 1], timestamp))
+                          # Name-only fallback stays on the currently visible page;
+                          # do not navigate old pages and guess a campaign identity.
+                          break
                       if not next_campaign_page(list_page):
                           break
-              print(f'Discovery complete: {len(fetched_new)} missing broadcast(s) fetched. Maximum {MAX_DISCOVERY_PAGES} list pages per run.', flush=True)
-              return fetched_new, list_available
+              candidates = latest_new_candidates(list(entries.values()), saved)
+              cutoff = max((chronological_time(date_with_time(rec)) for rec in saved.values()), default=float('-inf'))
+              fetched = []
+              if entries:
+                  for cid, name in candidates:
+                      try:
+                          record = fetch_campaign(detail_page, name, campaign_id=cid)
+                          if record['Campaign ID'] not in saved:
+                              fetched.append(record)
+                      except Exception as exc:
+                          print(f'WARNING: New sent broadcast {cid} could not be captured; retry next run: {exc}', flush=True)
+              elif fallback_rows:
+                  saved_names = {rec['Campaign Name'] for rec in saved.values()}
+                  for name, timestamp in sorted(set(fallback_rows), key=lambda row: row[1], reverse=True)[:MAX_CAMPAIGNS]:
+                      if name in saved_names or (saved and timestamp < cutoff):
+                          continue
+                      try:
+                          record = fetch_campaign(detail_page, name)
+                          if record['Campaign ID'] not in saved:
+                              fetched.append(record)
+                      except Exception as exc:
+                          print(f'WARNING: New sent broadcast {name} could not be captured; retry next run: {exc}', flush=True)
+              print(f'Latest sent broadcasts checked; new records fetched: {len(fetched)}.', flush=True)
+              return fetched, list_available
 
           def content_from_campaign(body, payloads, campaign_id):
               candidates = []
@@ -594,50 +600,43 @@ jobs:
               return '', 'Content unavailable', ''
 
           def content_from_preview(page):
-              # The sent message is the white preview card shown below Overview.
-              # It contains prose, external links and optionally a video/image.
+              # Only the message-card sibling of this campaign's details qualifies.
+              # Never scan arbitrary links, greetings or media across the page.
               return page.evaluate(r"""() => {
-                  const forbidden = /(?:^|\n)\s*(?:Campaign Type|Total Credit Usage|Campaign Messages \(per day\)|Rows per page:|Created At|Campaign Duration|Template Name)\s*(?:\n|$)/i;
-                  const seeds = [];
-                  for (const el of document.querySelectorAll('video,video source,a[href],img')) {
-                      const url = el.currentSrc || el.src || el.href || '';
-                      if (el.tagName === 'VIDEO' || el.tagName === 'SOURCE') seeds.push({el,priority:0});
-                      else if (el.tagName === 'A' && /^https?:/.test(url) && !/(?:^|\.)aisensy\.com$/.test(new URL(url).hostname)) seeds.push({el,priority:1});
-                      else if (el.tagName === 'IMG' && !/logo|icon|avatar/i.test(url)) seeds.push({el,priority:2});
-                  }
-                  // Text-only broadcasts have no media; locate their greeting.
-                  for (const el of document.querySelectorAll('p,div,span')) {
-                      const text = (el.innerText || '').trim();
-                      if (/^(?:Dear|Hi|Hello)\b/i.test(text) && text.length >= 80 && !forbidden.test(text)) seeds.push({el,priority:0});
-                  }
-                  const candidates = [];
-                  for (const seed of seeds) {
-                      let el = seed.el;
-                      for (let i=0; el && i<10; i++,el=el.parentElement) {
-                          if (el.tagName === 'BODY' || el.tagName === 'HTML') break;
-                          if (!el.getClientRects().length) continue;
-                          const text = (el.innerText || '').trim();
-                          if (text.length < 80 || text.length > 48000 || forbidden.test(text)) continue;
-                          if (/^(?:Manage|Live Chat|Contacts|Campaigns|History|All Projects)(?:\n|$)/i.test(text)) continue;
-                          const links = Array.from(el.querySelectorAll('a[href]')).map(a=>a.href).filter(u=>/^https?:/.test(u));
-                          const media = Array.from(el.querySelectorAll('video,video source,img[src]')).map(a=>a.currentSrc || a.src).filter(u=>u && /^https?:/.test(u) && !/logo|icon|avatar|whatsapp/i.test(u));
-                          candidates.push({text,priority:seed.priority,urls:[...new Set([...links,...media])]});
+                  const forbidden = /Campaign Type|Total Credit Usage|Campaign Messages \(per day\)|Rows per page:|Created At|Campaign Duration|Template Name/i;
+                  const cards = new Set();
+                  const anchors = [...document.querySelectorAll('span,p,div')].filter(el =>
+                      (el.textContent || '').trim() === 'Campaign Duration');
+                  for (const anchor of anchors) {
+                      let details = anchor.parentElement;
+                      for (let depth=0; details && depth<7; depth++,details=details.parentElement) {
+                          if (details.tagName === 'BODY' || details.tagName === 'HTML') break;
+                          const detailText = details.innerText || '';
+                          if (!/Campaign Type/i.test(detailText) || !/Campaign Duration/i.test(detailText)) continue;
+                          const card = details.nextElementSibling;
+                          if (!card || !card.getClientRects().length) continue;
+                          const text = (card.innerText || '').trim();
+                          if (text.length < 40 || text.length > 48000 || forbidden.test(text)) continue;
+                          cards.add(card);
                       }
                   }
-                  if (!candidates.length) return '';
-                  const bestPriority = Math.min(...candidates.map(c=>c.priority));
-                  const ranked = candidates.filter(c=>c.priority === bestPriority).sort((a,b)=>b.text.length-a.text.length);
-                  const best = ranked[0];
-                  // Compare the text before appending URLs; media ancestors can
-                  // otherwise look like conflicting candidates for the same card.
-                  if (!ranked.every(c=>best.text.includes(c.text))) return '';
-                  let result = best.text;
-                  for (const url of best.urls) if (!result.includes(url)) result += '\n' + url;
-                  return result;
+                  // Distinct cards are ambiguous. One containing the others is
+                  // the full message card, including footer/buttons/media.
+                  const candidates = [...cards];
+                  const outer = candidates.filter(el => candidates.every(other => el === other || el.contains(other)));
+                  if (outer.length !== 1) return '';
+                  const card = outer[0];
+                  let text = (card.innerText || '').trim();
+                  const links = [...card.querySelectorAll('a[href]')].map(a=>a.href).filter(u=>/^https?:/.test(u));
+                  const media = [...card.querySelectorAll('video,video source,img[src]')].map(el=>el.currentSrc || el.src).filter(u=>u && /^https?:/.test(u) && !/logo|icon|avatar|whatsapp/i.test(u));
+                  for (const url of [...new Set([...links,...media])]) if (!text.includes(url)) text += '\n' + url;
+                  return text;
               }""")
 
           def fetch_broadcast_content(page, payloads, campaign_id):
               try:
+                  if not re.search(rf'/view/{re.escape(campaign_id)}(?:[/?#]|$)', page.url):
+                      return '', 'Campaign ID mismatch; content not stored', ''
                   # Scrolling loads lazy-rendered previews below the overview cards.
                   page.evaluate('''() => {
                       window.scrollTo(0, document.body.scrollHeight);
@@ -652,13 +651,7 @@ jobs:
                   text = content_from_preview(page)
                   if text:
                       status = 'Template placeholders remain' if re.search(r'{{.*?}}|\$FirstName|\$Name', text, re.I) else 'Captured preview'
-                      return text, status, 'AiSensy WhatsApp message preview'
-                  result = content_from_campaign(page.locator('body').inner_text(), payloads, campaign_id)
-                  if result[0]:
-                      return result
-                  result = linked_template_content(payloads, campaign_id)
-                  if result[0]:
-                      return result
+                      return text, status, f'Campaign {campaign_id} | Preview v11'
                   print(f'Content preview/template unavailable for {campaign_id}; preserving any previous message.', flush=True)
                   return '', 'Content unavailable', ''
               except Exception as exc:
@@ -666,6 +659,7 @@ jobs:
                   return '', 'Content lookup failed; previous value retained', ''
 
           def fetch_campaign(page, name, campaign_id=None):
+              expected_id = campaign_id
               with campaign_responses(page) as payloads, content_responses(page) as content_payloads:
                   if campaign_id:
                       page.goto(f'{LIST_URL}/view/{campaign_id}', wait_until='domcontentloaded', timeout=30000)
@@ -679,7 +673,15 @@ jobs:
                   page.get_by_text('Total Credit Usage', exact=True).first.wait_for(timeout=30000)
                   page.wait_for_timeout(500)
                   campaign_id = re.search(r'/view/([A-Za-z0-9]+)', page.url).group(1)
+                  if expected_id and campaign_id != expected_id:
+                      raise RuntimeError('Opened campaign ID does not match requested broadcast')
                   body = page.locator('body').inner_text()
+                  status_match = re.search(r'(?im)^\s*Status\s*\n\s*([A-Z_]+)', body)
+                  if not status_match or status_match.group(1).upper() != 'SENT':
+                      raise RuntimeError('Campaign is not confirmed SENT; skipped')
+                  type_match = re.search(r'(?im)^\s*Campaign Type\s*\n\s*([A-Z_]+)', body)
+                  if not type_match or type_match.group(1).upper() != 'BROADCAST':
+                      raise RuntimeError('Campaign is not confirmed BROADCAST; skipped')
                   values = {
                       'Audience Size': metric(body, 'Audience'),
                       'Sent': metric(body, 'Sent'),
@@ -691,7 +693,7 @@ jobs:
                   missing = [key for key, value in values.items() if value is None]
                   if missing:
                       raise RuntimeError(f'Missing metrics for {name}: {missing}')
-                  if contents_by_id.get(campaign_id, {}).get('Message Content'):
+                  if contents_by_id.get(campaign_id, {}).get('Message Content') and contents_by_id[campaign_id].get('Content Source') == f'Campaign {campaign_id} | Preview v11':
                       message_content, content_status, content_source = '', '', ''
                   else:
                       message_content, content_status, content_source = fetch_broadcast_content(page, content_payloads, campaign_id)
@@ -774,15 +776,6 @@ jobs:
           def newest_activity(rec):
               return max(chronological_time(date_with_time(rec)), chronological_time(rec.get('Last Updated')))
 
-          def historical_batch(ids, cursor, limit):
-              ids = sorted(set(ids))
-              if not ids:
-                  return [], ''
-              start = ids.index(cursor) if cursor in ids else next((i for i, cid in enumerate(ids) if cid > cursor), 0)
-              size = min(limit, len(ids))
-              selected = [ids[(start + i) % len(ids)] for i in range(size)]
-              return selected, ids[(start + size) % len(ids)]
-
           def sort_campaign_rows(ws, positions, desired_ids):
               # Move whole rows so custom notes/columns stay with their campaign.
               last_row = max(positions.values(), default=1)
@@ -853,12 +846,6 @@ jobs:
 
           sheets_by_title = {ws.title: ws for ws in spreadsheet.worksheets()}
           sync_metadata = spreadsheet.fetch_sheet_metadata()
-          cursor_entries = [entry for entry in sync_metadata.get('developerMetadata', [])
-                            if entry.get('metadataKey') == 'aisensy_history_cursor']
-          cursor_entry = cursor_entries[0] if cursor_entries else None
-          history_cursor = cursor_entry.get('metadataValue', '') if cursor_entry else ''
-          next_history_cursor = history_cursor
-
           analysis_ws = sheets_by_title.get('Broadcast Analysis')
           source_times = read_analysis_times(analysis_ws) if analysis_ws else {}
           contents_ws = sheets_by_title.get('Broadcast Contents')
@@ -895,23 +882,13 @@ jobs:
               list_page = context.new_page()
               page = context.new_page()
               fetched, list_available = discover_new_broadcasts(list_page, page, existing_by_id)
-              # At most five older campaigns per run, rotating across all history.
-              fetched_ids = {rec['Campaign ID'] for rec in fetched}
-              candidates = [cid for cid in order if cid not in fetched_ids and re.fullmatch(r'[A-Za-z0-9]+', cid)]
-              selected, next_history_cursor = historical_batch(candidates, history_cursor, HISTORICAL_BATCH_SIZE)
-              print(f'Historical refresh: {len(selected)} of {len(candidates)} saved campaigns this run.', flush=True)
-              for cid in selected:
-                  try:
-                      rec = fetch_campaign(page, existing_by_id[cid]['Campaign Name'], campaign_id=cid)
-                      fetched.append(rec)
-                  except Exception as exc:
-                      print(f'WARNING: Historical campaign {cid} could not be refreshed; saved row retained: {exc}', flush=True)
               browser.close()
 
           if not list_available:
               raise RuntimeError('AiSensy campaign list returned no names. Session may have expired or the page changed; spreadsheet was not modified.')
-          if not fetched and not existing_by_id:
-              raise RuntimeError('No broadcast records could be fetched. Spreadsheet was not modified.')
+          if not fetched:
+              print('Nothing was updated: no new sent broadcasts were captured. All sheets left unchanged.', flush=True)
+              sys.exit(0)
           sync_time = ist_now()
           new_ids = {rec['Campaign ID'] for rec in fetched if rec['Campaign ID'] not in existing_by_id}
 
@@ -920,7 +897,7 @@ jobs:
           if new_ids:
               print(f'{len(new_ids)} new broadcast(s) found; refreshing fetched campaign metrics.', flush=True)
           else:
-              print('No new broadcasts; refreshing fetched campaign metrics.', flush=True)
+              print('Nothing was updated.', flush=True)
 
           new_count = 0
           updated_count = 0
@@ -949,13 +926,10 @@ jobs:
                   new_count += 1
               existing_by_id[cid] = rec
 
-          # New broadcasts and genuinely changed metrics rise to the top.
-          # Checking an unchanged campaign does not change its Last Updated time.
-          records = sorted(
-              (existing_by_id[cid] for cid in order),
-              key=lambda rec: (1 if rec['Campaign ID'] in new_ids else 0, newest_activity(rec), chronological_time(date_with_time(rec)), rec['Campaign ID']),
-              reverse=True,
-          )
+          # Add new broadcasts above existing rows. Never promote older history.
+          latest_records = sorted((existing_by_id[cid] for cid in new_ids),
+                                  key=lambda rec: (chronological_time(date_with_time(rec)), rec['Campaign ID']), reverse=True)
+          records = latest_records + [existing_by_id[cid] for cid in order if cid not in new_ids]
           missing_source_ids = set(source_times) - set(existing_by_id)
           if missing_source_ids:
               raise RuntimeError('Source times include campaigns missing from Broadcast_Data; no cleanup was performed.')
@@ -1319,22 +1293,6 @@ jobs:
               {'updateDimensionProperties': {'range': {'sheetId': contents_ws.id, 'dimension': 'COLUMNS', 'startIndex': 1, 'endIndex': 3}, 'properties': {'pixelSize': 260}, 'fields': 'pixelSize'}},
               {'autoResizeDimensions': {'dimensions': {'sheetId': contents_ws.id, 'dimension': 'ROWS', 'startIndex': 1, 'endIndex': len(content_rows)+1}}},
           ]})
-
-          # Persist rotation only after all report writes succeeded. Spreadsheet
-          # metadata stores the cursor without adding tabs or visible cells.
-          if next_history_cursor != history_cursor:
-              if cursor_entry:
-                  cursor_request = {'updateDeveloperMetadata': {
-                      'dataFilters': [{'developerMetadataLookup': {'metadataId': cursor_entry['metadataId']}}],
-                      'developerMetadata': {'metadataValue': next_history_cursor},
-                      'fields': 'metadataValue',
-                  }}
-              else:
-                  cursor_request = {'createDeveloperMetadata': {'developerMetadata': {
-                      'metadataKey': 'aisensy_history_cursor', 'metadataValue': next_history_cursor,
-                      'visibility': 'DOCUMENT', 'location': {'spreadsheet': True},
-                  }}}
-              spreadsheet.batch_update({'requests': [cursor_request]})
 
           print(f'Sync complete: {new_count} new, {updated_count} updated, {len(records)} total campaigns.', flush=True)
           PY
