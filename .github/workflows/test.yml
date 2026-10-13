@@ -21,10 +21,12 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
+
       - name: Install dependencies
         run: |
           pip install playwright gspread google-auth
           python -m playwright install --with-deps chromium
+
       - name: Fetch up to 5 campaigns and update all sheets
         env:
           AISENSY_SESSION: ${{ secrets.AISENSY_SESSION }}
@@ -252,17 +254,17 @@ jobs:
               raise RuntimeError('AiSensy campaigns were listed but none could be fetched. Spreadsheet was not modified.')
           sync_time = ist_now()
           new_ids = {rec['Campaign ID'] for rec in fetched if rec['Campaign ID'] not in existing_by_id}
-          # Always rebuild the three views to normalize older UTC timestamps and
-          # keep newest campaigns at the top. Existing metrics are not refreshed
-          # unless at least one new campaign was discovered.
+
+          # Refresh every successfully fetched campaign on every run.
+          # Retain historical campaigns that were not fetched this time.
           if new_ids:
-              print(f'{len(new_ids)} new broadcast(s) found; refreshing campaign metrics.', flush=True)
+              print(f'{len(new_ids)} new broadcast(s) found; refreshing fetched campaign metrics.', flush=True)
           else:
-              print('No new broadcasts; retaining existing metrics and normalizing display.', flush=True)
+              print('No new broadcasts; refreshing fetched campaign metrics.', flush=True)
 
           new_count = 0
           updated_count = 0
-          for rec in (fetched if new_ids else []):
+          for rec in fetched:
               cid = rec['Campaign ID']
               if cid in existing_by_id:
                   old = existing_by_id[cid]
@@ -274,9 +276,9 @@ jobs:
                   new_count += 1
               existing_by_id[cid] = rec
 
-          # Date descending, with newly fetched campaigns first within the same
-          # date. Preserve existing relative order for other same-day campaigns.
-          fetched_rank = {rec['Campaign ID']: idx for idx, rec in enumerate(fetched)} if new_ids else {}
+          # Date descending, with fetched campaigns first within the same date.
+          # Preserve existing relative order for other same-day campaigns.
+          fetched_rank = {rec['Campaign ID']: idx for idx, rec in enumerate(fetched)}
           original_rank = {cid: idx for idx, cid in enumerate(order)}
           records = sorted(
               (existing_by_id[cid] for cid in order),
@@ -343,7 +345,7 @@ jobs:
               ['Overall Read Rate', total_read / total_delivered if total_delivered else 0],
               ['Average Cost per Sent Message', total_cost / total_sent if total_sent else 0],
               ['Last Sync (IST)', sync_time],
-              ['Campaigns Added This Sync', new_count, (f'{new_count} new campaign(s) added' if new_count else ('No campaign data fetched; nothing was updated' if not fetched else 'No new campaigns; nothing was updated'))],
+              ['Campaigns Added This Sync', new_count, f'{new_count} new campaign(s) added; {updated_count} existing campaign(s) refreshed'],
               ['CAMPAIGN PERFORMANCE'],
               ['Campaign Name', 'Date', 'Sent', 'Delivered', 'Read', 'Failed', 'Delivery Rate', 'Read Rate', 'Actual Cost (INR)'],
           ]
@@ -370,6 +372,7 @@ jobs:
 
           print(f'Sync complete: {new_count} new, {updated_count} updated, {len(records)} total campaigns.', flush=True)
           PY
+
       - name: Record failed sync in Dashboard
         if: ${{ failure() }}
         continue-on-error: true
@@ -384,14 +387,24 @@ jobs:
           from zoneinfo import ZoneInfo
           import gspread
           from google.oauth2.service_account import Credentials
+
           raw = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '').strip() or os.environ.get('GOOGLE_CREDENTIALS', '').strip()
           if not raw:
               raise RuntimeError('No Google credentials to report failed sync')
-          creds = Credentials.from_service_account_info(json.loads(raw), scopes=['https://www.googleapis.com/auth/spreadsheets'])
+
+          creds = Credentials.from_service_account_info(
+              json.loads(raw),
+              scopes=['https://www.googleapis.com/auth/spreadsheets']
+          )
           sheet_id = os.environ.get('GOOGLE_SHEET_ID', '').strip() or '1jXnQPQngi-FbEBBHC0tvaOTXxmtE5_miv6Mq0rTbmLQ'
           ws = gspread.authorize(creds).open_by_key(sheet_id).worksheet('Dashboard')
           timestamp = datetime.now(ZoneInfo('Asia/Kolkata')).strftime('%Y-%m-%d %I:%M:%S %p IST')
+
           # Do not overwrite Last Sync: it records the last successful sync.
-          ws.update(range_name='C14', values=[[f'FAILED check at {timestamp}; see GitHub Actions logs']], value_input_option='RAW')
+          ws.update(
+              range_name='C14',
+              values=[[f'FAILED check at {timestamp}; see GitHub Actions logs']],
+              value_input_option='RAW'
+          )
           print('Recorded failure status in Dashboard; last successful sync timestamp retained.')
           PY
