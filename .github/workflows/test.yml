@@ -404,8 +404,8 @@ jobs:
           analysis_ws = sheets_by_title.get('Broadcast Analysis')
           source_times = read_analysis_times(analysis_ws) if analysis_ws else {}
           webinar_ws = sheets_by_title.get('Webinar Dashboard')
-          # Snapshot only when removing dependencies. Keep existing cells/layout.
-          webinar_snapshot = webinar_ws.get_all_values() if webinar_ws and any(title in sheets_by_title for title in ('Broadcast Analysis', 'Message Tests', 'Dashboard Settings')) else None
+          if analysis_ws is None and webinar_ws is None:
+              raise RuntimeError('Neither Webinar Dashboard nor Broadcast Analysis exists; no spreadsheet changes were made.')
 
           existing_rows = data_ws.get_all_values()
           existing_by_id = {}
@@ -576,21 +576,128 @@ jobs:
               if ws.acell(f'{col}1').value == label:
                   ws.batch_clear([f'{col}1:{col}{ws.row_count}'])
 
-          if webinar_snapshot:
-              # Replacing dependent formulas with their displayed values keeps
-              # the current webinar report readable after its sources are removed.
-              width = max(len(row) for row in webinar_snapshot)
-              webinar_ws.clear()
-              update_values(webinar_ws, 'A1', [row + [''] * (width - len(row)) for row in webinar_snapshot])
-              spreadsheet.batch_update({'requests': [{
-                  'setDataValidation': {
-                      'range': {'sheetId': webinar_ws.id},
-                      'rule': None,
-                  }
-              }]})
+          # Replace the first report in place. No schedule/settings tabs are created.
+          # If both report tabs exist, retain the existing Broadcast Analysis tab.
+          if analysis_ws is None:
+              if webinar_ws is None:
+                  raise RuntimeError('Neither Webinar Dashboard nor Broadcast Analysis exists; no new tab was created.')
+              webinar_ws.update_title('Broadcast Analysis')
+              analysis_ws = webinar_ws
+              webinar_ws = None
 
-          # Cleanup is last: source times and reports have already been saved.
-          for title in ('Broadcast Analysis', 'Message Tests', 'Dashboard Settings'):
+          analysis_headers = [
+              'Campaign ID', 'Campaign Name', 'Audience Size', 'Sent', 'Delivered',
+              'Read', 'Failed', 'Actual Cost', 'Last Updated', 'Sent At (IST)',
+              'Send Day', 'Send Hour', 'Webinar Start (inferred)', 'Webinar (inferred)',
+              'Webinar Date (inferred)', 'Hours Before Start', 'Timing Stage (inferred)',
+              'Message Type', 'Content Angle', 'Delivery Rate', 'Read Rate',
+              'Cost per Read', 'Data Status', 'Ranked', 'Data Check',
+          ]
+          analysis_rows = []
+          for rec in records:
+              sent, delivered, read = count(rec['Sent']), count(rec['Delivered']), count(rec['Read'])
+              cost = number(rec['Actual Cost'])
+              stamp = rec.get('Broadcast Sent At (IST)', '')
+              try:
+                  local = datetime.strptime(stamp, '%Y-%m-%d %I:%M:%S %p IST').replace(tzinfo=IST)
+              except ValueError:
+                  local = None
+              name = rec['Campaign Name'].lower()
+              if 'renew' in name:
+                  message_type = 'Renewal offer'
+              elif any(word in name for word in ('live', 'started', 'joinnow')):
+                  message_type = 'Live now'
+              elif any(word in name for word in ('missed', 're-register', 'reregister')):
+                  message_type = 'Missed / re-register'
+              elif any(word in name for word in ('closing', 'deadline', 'lastchance', 'last chance')):
+                  message_type = 'Sales / closing'
+              else:
+                  message_type = 'Reminder'
+              angle = 'General'
+              for words, category in (
+                  (('closing', 'deadline', 'last chance'), 'Deadline / closing'),
+                  (('income', 'earn', 'salary'), 'Income'),
+                  (('bonus',), 'Bonus'), (('discount', 'offer'), 'Offer'),
+                  (('faceless',), 'Faceless'),
+              ):
+                  if any(word in name for word in words):
+                      angle = category
+                      break
+              webinar_start = None
+              if local and message_type != 'Renewal offer':
+                  candidates = []
+                  # Existing webinar schedule, kept in code rather than another tab.
+                  for offset in range(-1, 8):
+                      day = (local + timedelta(days=offset)).date()
+                      for weekday, hour, minute in ((6, 11, 0), (6, 19, 30), (1, 19, 30), (2, 19, 30)):
+                          if day.weekday() != weekday:
+                              continue
+                          start = datetime(day.year, day.month, day.day, hour, minute, tzinfo=IST)
+                          if start >= local - timedelta(minutes=90):
+                              candidates.append(start)
+                  if candidates:
+                      webinar_start = min(candidates)
+              hours_before = (webinar_start - local).total_seconds() / 3600 if webinar_start else ''
+              stage = ''
+              if webinar_start:
+                  if hours_before <= 0:
+                      stage = 'Live / after start'
+                  elif hours_before < 1:
+                      stage = 'Within 1 hour before'
+                  elif hours_before <= 6:
+                      stage = '1 to 6 hours before'
+                  elif local.date() == webinar_start.date():
+                      stage = 'Same day, 6h+ before'
+                  elif (webinar_start.date() - local.date()).days == 1:
+                      stage = 'Day before'
+                  else:
+                      stage = '2+ days before'
+              final = bool(local and datetime.now(IST) - local >= timedelta(hours=18))
+              status = 'Final' if final else ('Still collecting' if local else 'Time unavailable')
+              issues = []
+              if delivered > sent:
+                  issues.append('Delivered count is higher than sent')
+              if read > delivered:
+                  issues.append('Read count is higher than delivered')
+              if count(rec['Failed']) > count(rec['Audience Size']):
+                  issues.append('Failed count is higher than audience')
+              if sent and delivered / sent < 0.8:
+                  issues.append('Low delivery rate')
+              if count(rec['Audience Size']) and count(rec['Failed']) / count(rec['Audience Size']) > 0.1:
+                  issues.append('High failure rate')
+              analysis_rows.append([
+                  rec['Campaign ID'], rec['Campaign Name'], count(rec['Audience Size']),
+                  sent, delivered, read, count(rec['Failed']), cost, rec['Last Updated'],
+                  stamp, local.strftime('%a') if local else '', local.hour if local else '',
+                  webinar_start.strftime('%Y-%m-%d %I:%M:%S %p IST') if webinar_start else '',
+                  webinar_start.strftime('%a %I:%M %p') if webinar_start else '',
+                  webinar_start.strftime('%Y-%m-%d') if webinar_start else '',
+                  hours_before, stage, message_type, angle,
+                  delivered / sent if sent else 0, read / delivered if delivered else 0,
+                  cost / read if read else '', status,
+                  'Yes' if final and sent >= 200 and message_type != 'Renewal offer' and not issues else 'No',
+                  '; '.join(issues),
+              ])
+          if analysis_ws.col_count < len(analysis_headers):
+              analysis_ws.add_cols(len(analysis_headers) - analysis_ws.col_count)
+          ensure_rows(analysis_ws, len(analysis_rows) + 1)
+          analysis_ws.clear()
+          update_values(analysis_ws, f'A1:Y{len(analysis_rows)+1}', [analysis_headers] + analysis_rows)
+          spreadsheet.batch_update({'requests': [{'setDataValidation': {'range': {'sheetId': analysis_ws.id}, 'rule': None}}]})
+          analysis_ws.freeze(rows=1)
+          analysis_ws.format(f'C2:G{len(analysis_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
+          analysis_ws.format(f'T2:U{len(analysis_rows)+1}', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
+          for col in ('H', 'V'):
+              analysis_ws.format(f'{col}2:{col}{len(analysis_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0.00'}})
+          for col in ('I', 'J', 'M', 'O'):
+              analysis_ws.format(f'{col}2:{col}{len(analysis_rows)+1}', {'numberFormat': {'type': 'TEXT'}})
+          analysis_ws.format(f'L2:L{len(analysis_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '0'}})
+          analysis_ws.format(f'P2:P{len(analysis_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '0.00'}})
+
+          # Cleanup only the explicitly unwanted tabs, after report writes succeed.
+          if webinar_ws is not None:
+              spreadsheet.del_worksheet(webinar_ws)
+          for title in ('Message Tests', 'Dashboard Settings', 'Broadcast Schedule'):
               ws = sheets_by_title.get(title)
               if ws is not None:
                   spreadsheet.del_worksheet(ws)
