@@ -1,1171 +1,1295 @@
-name: FlexiFunnels Discrepancy Tracker
+name: Sync AiSensy Broadcasts to Google Sheets
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 0 * * *" # Daily at 06:00 Asia/Kolkata
+    - cron: '23 */2 * * *'  # Every 2 hours, offset from GitHub's busy minute 0
 
 permissions:
   contents: read
 
+concurrency:
+  group: aisensy-google-sheets-sync
+  cancel-in-progress: false
+
 jobs:
-
-  test-google-sheets:
-    name: Test Google Sheets Connection
+  sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
+    timeout-minutes: 25
     steps:
-
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: Install Google Sheets dependencies
+      - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install gspread google-auth
+          pip install playwright gspread google-auth
+          python -m playwright install --with-deps chromium
 
-      - name: Verify Google Sheets access
+      - name: Refresh latest broadcasts and rotating historical batch
         env:
+          AISENSY_SESSION: ${{ secrets.AISENSY_SESSION }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          RAW_DATA_SHEET_ID: ${{ vars.RAW_DATA_SHEET_ID }}
-          UTM_SHEET_ID: ${{ vars.UTM_SHEET_ID }}
-          DISCREPANCY_SHEET_ID: ${{ vars.DISCREPANCY_SHEET_ID }}
-          UTM_LANDING_TAB: ${{ vars.UTM_LANDING_TAB }}
-          UTM_REG_TAB: ${{ vars.UTM_REG_TAB }}
-          DISCREPANCY_TAB_NAME: ${{ vars.DISCREPANCY_TAB_NAME }}
-
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          GOOGLE_SHEET_ID: ${{ vars.GOOGLE_SHEET_ID }}
         run: |
-          python -u - <<'PY'
+          python - <<'PY'
           import json
           import os
-
+          import re
+          from contextlib import contextmanager
+          from datetime import timedelta
+          from datetime import datetime, timezone
+          from zoneinfo import ZoneInfo
+          from playwright.sync_api import sync_playwright
           import gspread
           from google.oauth2.service_account import Credentials
 
-          print("=" * 60)
-          print("GOOGLE SHEETS TEST - VERSION 14")
-          print("=" * 60)
+          PROJECT_ID = '6589906ef69fc70b424e0e43'
+          LIST_URL = f'https://www.app.aisensy.com/projects/{PROJECT_ID}/campaigns/all'
+          MAX_CAMPAIGNS = 5
+          HISTORICAL_BATCH_SIZE = 5
+          SHEET_ID = os.environ.get('GOOGLE_SHEET_ID', '').strip() or '1jXnQPQngi-FbEBBHC0tvaOTXxmtE5_miv6Mq0rTbmLQ'
+          IST = ZoneInfo('Asia/Kolkata')
 
-          required = [
-              "GOOGLE_SERVICE_ACCOUNT_JSON",
-              "RAW_DATA_SHEET_ID",
-              "UTM_SHEET_ID",
-              "DISCREPANCY_SHEET_ID",
-              "UTM_LANDING_TAB",
-              "UTM_REG_TAB",
-              "DISCREPANCY_TAB_NAME",
-          ]
+          def ist_now():
+              return datetime.now(IST).strftime('%Y-%m-%d %I:%M:%S %p IST')
 
-          missing = [
-              key
-              for key in required
-              if not os.environ.get(key, "").strip()
-          ]
-
-          if missing:
-              raise RuntimeError(
-                  "Missing configuration: " + ", ".join(missing)
-              )
-
-          credentials = Credentials.from_service_account_info(
-              json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]),
-              scopes=[
-                  "https://www.googleapis.com/auth/spreadsheets.readonly"
-              ],
-          )
-
-          client = gspread.authorize(credentials)
-
-          spreadsheets = {
-              "RAW DATA": os.environ["RAW_DATA_SHEET_ID"],
-              "UTM": os.environ["UTM_SHEET_ID"],
-              "DISCREPANCY STATS": os.environ["DISCREPANCY_SHEET_ID"],
-          }
-
-          opened = {}
-
-          for label, spreadsheet_id in spreadsheets.items():
-
-              spreadsheet = client.open_by_key(spreadsheet_id)
-
-              opened[label] = spreadsheet
-
-              print()
-              print(label + ": CONNECTED")
-              print("Spreadsheet:", spreadsheet.title)
-              print("Tabs:", len(spreadsheet.worksheets()))
-
-          checks = [
-              ("UTM_LANDING_TAB", "UTM"),
-              ("UTM_REG_TAB", "UTM"),
-              ("DISCREPANCY_TAB_NAME", "DISCREPANCY STATS"),
-          ]
-
-          for variable, spreadsheet_label in checks:
-
-              tab_name = os.environ[variable].strip()
-
+          def existing_time_to_ist(value):
+              value = str(value or '').strip()
+              if not value:
+                  return value
+              if value.endswith(' IST'):
+                  return value
               try:
-                  opened[spreadsheet_label].worksheet(tab_name)
+                  parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+                  if parsed.tzinfo is None:
+                      parsed = parsed.replace(tzinfo=timezone.utc)
+                  return parsed.astimezone(IST).strftime('%Y-%m-%d %I:%M:%S %p IST')
+              except ValueError:
+                  return value
 
-                  print(variable + ": FOUND")
+          HEADERS = ['Campaign ID', 'Campaign Name', 'Date', 'Campaign Type', 'Audience Size', 'Sent', 'Delivered', 'Read', 'Failed', 'Delivery Rate', 'Read Rate', 'Cost per Message', 'Estimated Cost', 'Actual Cost', 'Last Updated']
 
-              except gspread.WorksheetNotFound:
-                  raise RuntimeError(
-                      variable + " does not match an existing tab."
-                  )
+          def number(value, default=0.0):
+              try:
+                  return float(re.sub(r'[^0-9.\-]', '', str(value)))
+              except (TypeError, ValueError):
+                  return default
 
-          print()
-          print("=" * 60)
-          print("GOOGLE SHEETS TEST SUCCESSFUL")
-          print("READ ONLY - NOTHING MODIFIED")
-          print("=" * 60)
-          PY
+          def count(value):
+              return int(number(value))
 
+          def metric(body, label):
+              match = re.search(rf'(?im)^\s*{re.escape(label)}\s*\n\s*([\d,]+)\s*$', body)
+              return count(match.group(1)) if match else None
 
-  test-flexifunnels:
-    name: Download both filtered FlexiFunnels reports (Version 14)
-    runs-on: ubuntu-latest
-    timeout-minutes: 35
-    steps:
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.11"
-      - name: Install Playwright
-        run: |
-          python -m pip install playwright
-          python -m playwright install --with-deps chromium
-      - name: Export yesterday through today
-        env:
-          FLEXIFUNNELS_EMAIL: ${{ secrets.FLEXIFUNNELS_EMAIL }}
-          FLEXIFUNNELS_PASSWORD: ${{ secrets.FLEXIFUNNELS_PASSWORD }}
-          FLEXIFUNNELS_PROJECT_URL: ${{ vars.FLEXIFUNNELS_PROJECT_URL }}
-          FLEXIFUNNELS_LANDING_URL: ${{ vars.FLEXIFUNNELS_LANDING_URL }}
-          FLEXIFUNNELS_REG_URL: ${{ vars.FLEXIFUNNELS_REG_URL }}
-          TIMEZONE: ${{ vars.TIMEZONE }}
-        run: |
-          python -u - <<'PY'
-          import os
-          import re
-          import time
-          import csv
-          from pathlib import Path
-          from datetime import datetime, timedelta
-          from urllib.parse import urlparse
-          from zoneinfo import ZoneInfo
-          from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+          def money(body):
+              match = re.search(r'(?im)^\s*Total Credit Usage\s*\n\s*₹\s*([\d,]+(?:\.\d+)?)', body)
+              return number(match.group(1)) if match else None
 
-          EMAIL = os.environ.get('FLEXIFUNNELS_EMAIL', '').strip()
-          PASSWORD = os.environ.get('FLEXIFUNNELS_PASSWORD', '')
-          PROJECT_URL = os.environ.get('FLEXIFUNNELS_PROJECT_URL', '').strip()
-          LANDING_URL = os.environ.get('FLEXIFUNNELS_LANDING_URL', '').strip()
-          REG_URL = os.environ.get(
-              "FLEXIFUNNELS_REG_URL", ""
-          ).strip()
+          def failed_count(body):
+              direct = metric(body, 'Failed')
+              if direct is not None:
+                  return direct
+              match = re.search(r'(?i)[\d.]+\s*%\s*\(\s*([\d,]+)\s*\)\s*Failed\b', body)
+              if match:
+                  return count(match.group(1))
+              return None
 
-          TIMEZONE = os.environ.get(
-              "TIMEZONE", "Asia/Kolkata"
-          ).strip() or "Asia/Kolkata"
+          def date_from_body(body):
+              match = re.search(r'(?i)Created At\s*\n\s*([A-Za-z]{3}\s+\d{1,2},\s+\d{4})', body)
+              if not match:
+                  return ''
+              try:
+                  return datetime.strptime(match.group(1), '%b %d, %Y').strftime('%Y-%m-%d')
+              except ValueError:
+                  return ''
 
+          def sent_time_from_body(body):
+              # Only explicit actual-sent labels qualify. Never use creation,
+              # scheduled, updated, completion, or first-observed timestamps.
+              label = re.compile(r'^(?:Broadcast Sent At|Campaign Sent At|Sent At|Sent On)\s*(?::\s*(.*))?$', re.I)
+              lines = [line.strip() for line in body.splitlines() if line.strip()]
+              for index, line in enumerate(lines):
+                  match = label.fullmatch(line)
+                  if not match:
+                      continue
+                  value = (match.group(1) or '').strip()
+                  if not value and index + 1 < len(lines):
+                      value = lines[index + 1]
+                  # Require a clock time and an explicit timezone. A timezone-free
+                  # UI value cannot safely be assumed to be IST or UTC.
+                  if not re.search(r'\d{1,2}:\d{2}', value):
+                      continue
+                  tz_match = re.search(r'\s*(IST|UTC|GMT|Z|[+-]\d{2}:?\d{2})$', value, re.I)
+                  if not tz_match:
+                      continue
+                  zone = tz_match.group(1).upper()
+                  stamp = value[:tz_match.start()].strip().rstrip(',').strip()
+                  if zone == 'IST':
+                      tz = IST
+                  elif zone in ('UTC', 'GMT', 'Z'):
+                      tz = timezone.utc
+                  else:
+                      try:
+                          offset = zone if ':' in zone else zone[:3] + ':' + zone[3:]
+                          tz = datetime.fromisoformat('2000-01-01T00:00:00' + offset).tzinfo
+                      except ValueError:
+                          continue
+                  parsed = None
+                  try:
+                      parsed = datetime.fromisoformat(stamp)
+                  except ValueError:
+                      for fmt in (
+                          '%b %d, %Y %I:%M:%S %p', '%b %d, %Y %I:%M %p',
+                          '%B %d, %Y %I:%M:%S %p', '%B %d, %Y %I:%M %p',
+                          '%b %d, %Y, %I:%M:%S %p', '%b %d, %Y, %I:%M %p',
+                          '%b %d, %Y %H:%M:%S', '%b %d, %Y %H:%M',
+                          '%Y-%m-%d %I:%M:%S %p', '%Y-%m-%d %I:%M %p',
+                      ):
+                          try:
+                              parsed = datetime.strptime(stamp, fmt)
+                              break
+                          except ValueError:
+                              pass
+                  if parsed is not None:
+                      return parsed.replace(tzinfo=tz).astimezone(IST).strftime('%Y-%m-%d %I:%M:%S %p IST')
+              return ''
 
-          EXPECTED_PROJECT_URL = (
-              "https://app.flexifunnels.com/projects/kvapNzyj"
-          )
+          def actual_sent_value(value):
+              # Numeric API timestamps are Unix seconds or milliseconds.
+              if isinstance(value, bool) or value is None:
+                  return ''
+              if isinstance(value, (int, float)) or re.fullmatch(r'\d{10}(?:\.\d+)?|\d{13}', str(value).strip()):
+                  try:
+                      seconds = float(value)
+                      if seconds >= 1e12:
+                          seconds /= 1000
+                      parsed = datetime.fromtimestamp(seconds, timezone.utc)
+                      if 2000 <= parsed.year <= 2100:
+                          return parsed.astimezone(IST).strftime('%Y-%m-%d %I:%M:%S %p IST')
+                  except (ValueError, OverflowError, OSError):
+                      pass
+                  return ''
+              return sent_time_from_body('Sent At: ' + str(value))
 
-          EXPECTED_LANDING_URL = (
-              "https://sb.flexifunnels.com/funnel-agent"
-          )
+          @contextmanager
+          def campaign_responses(page):
+              payloads = []
+              def capture(response):
+                  # Read existing browser responses; no guessed API calls.
+                  if len(payloads) >= 100:
+                      return
+                  if not re.match(r'https://(?:[A-Za-z0-9-]+\.)*aisensy\.com/', response.url, re.I):
+                      return
+                  if not re.search(r'campaign|broadcast', response.url, re.I):
+                      return
+                  if response.request.resource_type not in ('xhr', 'fetch'):
+                      return
+                  try:
+                      if response.ok and 'json' in response.headers.get('content-type', '').lower():
+                          payload = response.json()
+                          if isinstance(payload, (dict, list)):
+                              payloads.append(payload)
+                  except Exception:
+                      pass  # Optional timestamp lookup cannot break metrics.
+              page.on('response', capture)
+              try:
+                  yield payloads
+              finally:
+                  page.remove_listener('response', capture)
 
-          EXPECTED_REG_URL = (
-              "https://sb.flexifunnels.com/flexi-genie-regteam"
-          )
+          def sent_time_from_responses(payloads, campaign_id):
+              allowed = {
+                  'sentat', 'senton', 'senttime', 'senttimestamp', 'sentdatetime',
+                  'broadcastsentat', 'broadcastsenttime', 'campaignsentat',
+                  'actualsentat', 'actualsenttime', 'actualsenttimestamp',
+              }
+              id_keys = {'id', 'campaignid', 'broadcastid'}
+              found = set()
+              observed_keys = set()
+              def normalized(key):
+                  return re.sub(r'[^a-z0-9]', '', str(key).lower())
+              def walk(value):
+                  if isinstance(value, list):
+                      for item in value:
+                          walk(item)
+                  elif isinstance(value, dict):
+                      ids = [str(v) for k, v in value.items() if normalized(k) in id_keys and not isinstance(v, (dict, list))]
+                      # Require a matching campaign object, never a recipient/message.
+                      if campaign_id in ids and not any(normalized(k) in {'messageid', 'contactid', 'recipientid', 'phone', 'phonenumber'} for k in value):
+                          observed_keys.update(str(k) for k in value if re.search(r'at$|time|date|sent', str(k), re.I))
+                          for key, item in value.items():
+                              if normalized(key) in allowed:
+                                  timestamp = actual_sent_value(item)
+                                  if timestamp:
+                                      found.add(timestamp)
+                      for item in value.values():
+                          if isinstance(item, (dict, list)):
+                              walk(item)
+              for payload in payloads:
+                  walk(payload)
+              if len(found) == 1:
+                  return next(iter(found))
+              if len(found) > 1:
+                  print(f'Conflicting explicit sent timestamps for {campaign_id}; retaining historical value.', flush=True)
+              elif observed_keys:
+                  print(f'No usable actual-sent field for {campaign_id}; timestamp field names: {sorted(observed_keys)}', flush=True)
+              return ''
 
+          def resolve_sent_time(body, payloads, campaign_id):
+              return sent_time_from_responses(payloads, campaign_id) or sent_time_from_body(body)
 
-          if not EMAIL or not PASSWORD:
-              raise RuntimeError(
-                  "FlexiFunnels credentials missing."
-              )
+          def source_time(value):
+              # Preserve the existing Broadcast Analysis values as requested.
+              # These values are not evidence of actual sending by themselves.
+              if isinstance(value, (int, float)) and not isinstance(value, bool):
+                  if 36526 <= value < 73416:
+                      local = datetime(1899, 12, 30) + timedelta(seconds=round(value * 86400))
+                      return local.strftime('%Y-%m-%d %I:%M:%S %p IST')
+                  return ''
+              return actual_sent_value(value)
 
-          if PROJECT_URL.rstrip("/") != EXPECTED_PROJECT_URL:
-              raise RuntimeError(
-                  "Unexpected project URL configuration."
-              )
-
-          if LANDING_URL.rstrip("/") != EXPECTED_LANDING_URL:
-              raise RuntimeError(
-                  "Unexpected landing URL configuration."
-              )
-
-          if REG_URL.rstrip("/") != EXPECTED_REG_URL:
-              raise RuntimeError(
-                  "Unexpected registration URL configuration."
-              )
-
-
-          today = datetime.now(
-              ZoneInfo(TIMEZONE)
-          ).date()
-
-          yesterday = today - timedelta(days=1)
-
-          print()
-          print("Timezone:", TIMEZONE)
-          print("Report start date:", yesterday.isoformat())
-          print("Report end date:", today.isoformat())
-          print("Date range: INCLUSIVE")
-          print()
-
-
-          def safe_location(page):
-
-              if page.is_closed():
-                  return "closed"
-
-              parsed = urlparse(page.url)
-
-              path = parsed.path
-
-              if (
-                  "login-as" in path
-                  or "token" in path.lower()
-                  or "callback" in path.lower()
-                  or "auth" in path.lower()
-              ):
-                  path = "/[sensitive-path-redacted]"
-
-              return (
-                  parsed.scheme
-                  + "://"
-                  + (parsed.hostname or "")
-                  + path
-              )
-
-
-          def current_path(page):
-
-              if page.is_closed():
-                  return ""
-
-              return urlparse(page.url).path.rstrip("/")
-
-
-          def visible_items(locator, limit=50):
-
-              result = []
-
-              for index in range(min(locator.count(), limit)):
-
-                  item = locator.nth(index)
-
-                  if item.is_visible():
-                      result.append(item)
-
+          def read_analysis_times(ws):
+              rows = ws.get_all_values(value_render_option='UNFORMATTED_VALUE')
+              if not rows:
+                  return {}
+              header = [str(v).strip() for v in rows[0]]
+              if 'Campaign ID' not in header or 'Sent At (IST)' not in header:
+                  raise RuntimeError('Broadcast Analysis lacks Campaign ID or Sent At (IST); cleanup was not performed.')
+              id_col, time_col = header.index('Campaign ID'), header.index('Sent At (IST)')
+              result = {}
+              for row in rows[1:]:
+                  if len(row) <= max(id_col, time_col):
+                      continue
+                  cid = str(row[id_col]).strip()
+                  value = source_time(row[time_col])
+                  if cid and value:
+                      if cid in result and result[cid] != value:
+                          raise RuntimeError(f'Conflicting source times for {cid}; cleanup was not performed.')
+                      result[cid] = value
               return result
 
-
-          def unique_visible(locator):
-
-              items = visible_items(locator)
-
-              if len(items) == 1:
-                  return items[0]
-
-              return None
-
-
-          def first_unique_visible(locators):
-
-              for locator in locators:
-
-                  candidate = unique_visible(locator)
-
-                  if candidate is not None:
-                      return candidate
-
-              return None
-
-
-          def wait_for_path_change(
-              page,
-              original,
-              seconds=25,
-          ):
-
-              deadline = time.monotonic() + seconds
-
-              while time.monotonic() < deadline:
-
-                  if current_path(page) != original:
-                      return current_path(page)
-
-                  time.sleep(1)
-
-              return current_path(page)
-
-
-          def find_login_field(page, selectors):
-
-              for selector in selectors:
-
-                  field = unique_visible(
-                      page.locator(selector)
-                  )
-
-                  if field is not None:
-                      return field
-
-              return None
-
-
-          def login(page):
-
-              print()
-              print("STEP 1: Opening FlexiFunnels login")
-
-              page.goto(
-                  "https://app.flexifunnels.com/login",
-                  wait_until="domcontentloaded",
-                  timeout=60000,
-              )
-
-              print("Location:", safe_location(page))
-
-              print()
-              print("STEP 2: Finding login fields")
-
-              email_field = find_login_field(
-                  page,
-                  [
-                      'input[type="email"]',
-                      'input[name="email"]',
-                      'input[autocomplete="username"]',
-                  ],
-              )
-
-              password_field = find_login_field(
-                  page,
-                  [
-                      'input[type="password"]',
-                  ],
-              )
-
-              if email_field is None or password_field is None:
-                  raise RuntimeError(
-                      "Login fields not found."
-                  )
-
-              print("Login fields found.")
-
-              print()
-              print("STEP 3: Entering credentials")
-
-              email_field.fill(EMAIL)
-
-              password_field.fill(PASSWORD)
-
-              print("Credentials entered.")
-
-              print()
-              print("STEP 4: Finding login button")
-
-              login_button = first_unique_visible(
-                  [
-                      page.locator('button[type="submit"]'),
-                      page.locator('input[type="submit"]'),
-                      page.locator(
-                          'button:has-text("Login")'
-                      ),
-                      page.locator(
-                          'button:has-text("Log in")'
-                      ),
-                      page.locator(
-                          'button:has-text("Sign in")'
-                      ),
-                  ]
-              )
-
-              print()
-              print("STEP 5: Submitting login")
-
-              if login_button is not None:
-                  login_button.click(timeout=15000)
-              else:
-                  password_field.press("Enter")
-
-              print("Login submitted.")
-
-              print()
-              print("STEP 6: Opening sub-user selection")
-
-              path = wait_for_path_change(
-                  page,
-                  "/login",
-                  seconds=25,
-              )
-
-              if path == "/login":
-
-                  page.goto(
-                      PROJECT_URL,
-                      wait_until="domcontentloaded",
-                      timeout=60000,
-                  )
-
-              page.wait_for_timeout(3000)
-
-              print(
-                  "Current location:",
-                  safe_location(page),
-              )
-
-              if current_path(page) != "/switch-sub-users":
-                  raise RuntimeError(
-                      "Sub-user selection screen missing."
-                  )
-
-              print(
-                  "SUB-USER SELECTION SCREEN DETECTED"
-              )
-
-
-          def select_saurabh(page):
-
-              print()
-              print("STEP 7: Finding Saurabh Bhatnagar")
-
-              exact_name = re.compile(
-                  r"^\s*Saurabh Bhatnagar\s*$",
-                  re.IGNORECASE,
-              )
-
-              name_element = unique_visible(
-                  page.get_by_text(exact_name)
-              )
-
-              if name_element is None:
-                  raise RuntimeError(
-                      "Saurabh Bhatnagar not found uniquely."
-                  )
-
-              print("Saurabh Bhatnagar: FOUND")
-
-              print()
-              print(
-                  "STEP 8: Finding Switch to user "
-                  "inside Saurabh's card"
-              )
-
-              # This is the selector confirmed working
-              # in Versions 9 through 12.
-
-              card = name_element.locator(
-                  "xpath=ancestor::*["
-                  ".//*["
-                  "self::a or self::button or @role='button'"
-                  "]["
-                  "contains("
-                  "translate(normalize-space(.), "
-                  "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
-                  "'abcdefghijklmnopqrstuvwxyz'), "
-                  "'switch to user'"
-                  ")"
-                  "]"
-                  "][1]"
-              )
-
-              if card.count() != 1 or not card.is_visible():
-                  raise RuntimeError(
-                      "Saurabh account card not found."
-                  )
-
-              print("Saurabh account card: FOUND")
-
-              switch_pattern = re.compile(
-                  r"^\s*Switch to user\s*$",
-                  re.IGNORECASE,
-              )
-
-              controls = card.locator(
-                  "a, button, [role='button']"
-              )
-
-              matches = []
-
-              for control in visible_items(controls):
-
-                  label = control.inner_text().strip()
-
-                  if switch_pattern.fullmatch(label):
-                      matches.append(control)
-
-              if len(matches) != 1:
-                  raise RuntimeError(
-                      "Saurabh Switch to user control "
-                      "not found uniquely."
-                  )
-
-              switch_control = matches[0]
-
-              if not switch_control.is_enabled():
-                  raise RuntimeError(
-                      "Switch to user control disabled."
-                  )
-
-              print(
-                  "Correct Switch to user control found."
-              )
-
-              print()
-              print("STEP 9: Switching to Saurabh")
-
-              switch_control.click(timeout=15000)
-
-              print(
-                  "Clicked Switch to user "
-                  "inside Saurabh's card."
-              )
-
-
-          def locate_switched_page(
-              context,
-              original_page,
-          ):
-
-              print()
-              print(
-                  "STEP 10: Checking browser tabs "
-                  "after sub-user switch"
-              )
-
-              deadline = time.monotonic() + 15
-
-              while time.monotonic() < deadline:
-
-                  pages = [
-                      candidate
-                      for candidate in context.pages
-                      if not candidate.is_closed()
-                  ]
-
-                  for candidate in reversed(pages):
-
-                      if candidate != original_page:
-
-                          print(
-                              "Additional browser tab detected."
-                          )
-
-                          parsed = urlparse(candidate.url)
-
-                          if (
-                              parsed.scheme != "https"
-                              or parsed.hostname
-                                 != "app.flexifunnels.com"
-                          ):
-                              raise RuntimeError(
-                                  "Unexpected switch destination."
-                              )
-
-                          return candidate
-
-                  if current_path(original_page) != "/switch-sub-users":
-
-                      print(
-                          "Original tab changed location."
-                      )
-
-                      return original_page
-
-                  time.sleep(1)
-
-              print(
-                  "No navigation or new tab detected. "
-                  "Continuing to Projects."
-              )
-
-              return original_page
-
-
-          def open_projects(page):
-
-              print()
-              print("Opening Projects page")
-
-              page.goto(
-                  "https://app.flexifunnels.com/projects",
-                  wait_until="domcontentloaded",
-                  timeout=60000,
-              )
-
-              page.wait_for_timeout(3000)
-
-              print(
-                  "Projects location:",
-                  safe_location(page),
-              )
-
-              if current_path(page) != "/projects":
-                  raise RuntimeError(
-                      "Projects page inaccessible."
-                  )
-
-              search_field = unique_visible(
-                  page.locator(
-                      'input[placeholder*="Search" i]'
-                  )
-              )
-
-              if search_field is None:
-                  raise RuntimeError(
-                      "Projects search field missing."
-                  )
-
-              print("Projects page verified.")
-
-
-          def select_published_url(page):
-
-              print()
-              print("Selecting Published URL filter")
-
-              native_selects = visible_items(
-                  page.locator("select")
-              )
-
-              for select in native_selects:
-
-                  options = select.locator("option")
-
-                  labels = [
-                      options.nth(i).inner_text().strip()
-                      for i in range(options.count())
-                  ]
-
-                  if "Published URL" in labels:
-
-                      select.select_option(
-                          label="Published URL"
-                      )
-
-                      print(
-                          "Published URL selected "
-                          "using native dropdown."
-                      )
-
-                      return
-
-              dropdown = first_unique_visible(
-                  [
-                      page.get_by_role(
-                          "button",
-                          name=re.compile(
-                              r"Project Name",
-                              re.IGNORECASE,
-                          ),
-                      ),
-                      page.get_by_role(
-                          "combobox",
-                          name=re.compile(
-                              r"Project",
-                              re.IGNORECASE,
-                          ),
-                      ),
-                      page.get_by_text(
-                          "Project Name",
-                          exact=True,
-                      ),
-                  ]
-              )
-
-              if dropdown is None:
-                  raise RuntimeError(
-                      "Project Name dropdown missing."
-                  )
-
-              dropdown.click(timeout=15000)
-
-              print("Project Name dropdown opened.")
-
-              page.wait_for_timeout(700)
-
-              option = first_unique_visible(
-                  [
-                      page.get_by_role(
-                          "option",
-                          name=re.compile(
-                              r"^\s*Published URL\s*$",
-                              re.IGNORECASE,
-                          ),
-                      ),
-                      page.get_by_role(
-                          "menuitem",
-                          name=re.compile(
-                              r"^\s*Published URL\s*$",
-                              re.IGNORECASE,
-                          ),
-                      ),
-                      page.get_by_text(
-                          "Published URL",
-                          exact=True,
-                      ),
-                  ]
-              )
-
-              if option is None:
-                  raise RuntimeError(
-                      "Published URL option missing."
-                  )
-
-              option.click(timeout=15000)
-
-              print("Published URL selected.")
-
-
-          def search_published_url(
-              page,
-              published_url,
-          ):
-
-              print()
-              print("Entering published URL")
-
-              search_field = unique_visible(
-                  page.locator(
-                      'input[placeholder*="Search" i]'
-                  )
-              )
-
-              if search_field is None:
-                  raise RuntimeError(
-                      "Published URL search field missing."
-                  )
-
-              search_field.fill(published_url)
-
-              print("Published URL entered.")
-
-              search_button = unique_visible(
-                  page.get_by_role(
-                      "button",
-                      name=re.compile(
-                          r"^\s*Search\s*$",
-                          re.IGNORECASE,
-                      ),
-                  )
-              )
-
-              if search_button is not None:
-
-                  print("Clicking Search.")
-
-                  search_button.click(timeout=15000)
-
-              else:
-
-                  print(
-                      "No separate Search button. "
-                      "Waiting for reactive search."
-                  )
-
-              print("Published URL search submitted.")
-
-              # IMPORTANT CHANGE:
-              #
-              # Do not wait for the browser URL to become
-              # /projects/kvapNzyj.
-              #
-              # Do not click Open Project.
-              #
-              # Instead inspect the Reports interface
-              # after the published URL search.
-
-              page.wait_for_timeout(4000)
-
-              print(
-                  "Location after search:",
-                  safe_location(page),
-              )
-
-
-          def wait_unique(locator, description, seconds=30):
-              deadline = time.monotonic() + seconds
-              while time.monotonic() < deadline:
-                  item = unique_visible(locator)
-                  if item is not None:
-                      return item
-                  time.sleep(0.25)
-              raise RuntimeError(description + ' missing or ambiguous; stopping.')
-
-
-          def click_text(page, text):
-              wait_unique(page.get_by_text(text, exact=True), text).click()
-
-
-          def verify_overview(page, published_url):
-              # Published URL search selects the page automatically in the recording.
-              # Require the requested URL to be displayed in Overview before proceeding.
-              deadline = time.monotonic() + 45
-              while time.monotonic() < deadline:
-                  if current_path(page) != urlparse(PROJECT_URL).path.rstrip('/'):
-                      time.sleep(0.5)
+          def date_with_time(rec):
+              return rec.get('Broadcast Sent At (IST)') or rec.get('Date', '')
+
+          def displayed_campaign_time(body):
+              match = re.search(r'(?im)^\s*Created At\s*\n\s*([^\n]+)', body)
+              if not match:
+                  return ''
+              value = match.group(1).strip()
+              explicit = actual_sent_value(value)
+              if explicit:
+                  return explicit
+              for fmt in ('%b %d, %Y, %I:%M:%S %p', '%b %d, %Y, %I:%M %p',
+                          '%b %d, %Y %I:%M:%S %p', '%b %d, %Y %I:%M %p'):
+                  try:
+                      return datetime.strptime(value, fmt).strftime('%Y-%m-%d %I:%M:%S %p IST')
+                  except ValueError:
+                      pass
+              return ''
+
+          def extract_names(body):
+              lines = [line.strip() for line in body.splitlines() if line.strip()]
+              names = []
+              for index, line in enumerate(lines):
+                  if line.upper() != 'BROADCAST' or index == 0:
                       continue
-                  values = [x.input_value() for x in visible_items(page.locator('input'))]
-                  exact = visible_items(page.get_by_text(published_url, exact=True))
-                  if published_url in values or len(exact) == 1:
-                      return
-                  time.sleep(0.5)
-              raise RuntimeError('Overview did not confirm the requested published URL.')
+                  candidate = lines[index - 1]
+                  if candidate.lower() in ('campaign', 'type', 'broadcast', 'status', 'audience'):
+                      continue
+                  nearby = ' '.join(lines[index + 1:index + 5])
+                  if not re.search(r'[A-Za-z]{3}\s+\d{1,2},\s+\d{4}', nearby):
+                      continue
+                  if candidate not in names:
+                      names.append(candidate)
+                  if len(names) >= MAX_CAMPAIGNS:
+                      break
+              return names
 
+          def wait_for_list(page):
+              page.goto(LIST_URL, wait_until='domcontentloaded', timeout=60000)
+              page.get_by_text('Rows per page:', exact=False).first.wait_for(timeout=30000)
+              page.wait_for_timeout(1400)
 
-          def open_recorded_reports(page, published_url):
-              # The recorded purple icon has the hover tooltip "Reports".
-              # The recorded Overview card contains Page Id and More. Restrict discovery
-              # to that card, excluding global navigation and the animated onboarding CTA.
-              more = wait_unique(page.get_by_text('More', exact=True), 'Overview More')
-              card = more.locator("xpath=ancestor::*[contains(., 'Page Id')][1]")
-              if card.count() != 1 or not card.is_visible():
-                  raise RuntimeError('Page Overview card could not be identified.')
-              card_values = [x.input_value() for x in visible_items(card.locator('input'))]
-              if published_url not in card_values and published_url not in card.inner_text():
-                  raise RuntimeError('Overview card does not contain the requested published URL.')
-              # Resolve semantic metadata at runtime; never click by icon position.
-              locators = [
-                  card.get_by_role('button', name='Reports', exact=True),
-                  card.get_by_role('link', name='Reports', exact=True),
-                  card.locator('[title="Reports"], [data-bs-original-title="Reports"], '
-                               '[data-original-title="Reports"], [data-tooltip="Reports"]'),
-              ]
-              control = first_unique_visible(locators)
-              if control is None:
-                  # Hover only to identify the recorded tooltip; do not click unknown icons.
-                  candidates = visible_items(card.locator('button, a, [role="button"], svg, '
-                                                         '[title], [data-bs-toggle="tooltip"], '
-                                                         '[data-toggle="tooltip"]'), 60)
-                  matched = {}
-                  skipped = 0
-                  for candidate in candidates:
-                      # Clear prior hover state before testing another control.
-                      page.mouse.move(0, 0)
-                      tooltip = page.get_by_text('Reports', exact=True)
-                      try:
-                          tooltip.wait_for(state='hidden', timeout=1500)
-                          candidate.hover(timeout=1500)
-                          tooltip.wait_for(state='visible', timeout=1000)
-                      except PlaywrightTimeoutError:
-                          skipped += 1
+          def discover_names(page):
+              best = []
+              for attempt in range(1, 4):
+                  wait_for_list(page)
+                  current = extract_names(page.locator('body').inner_text())
+                  print(f'Campaign discovery attempt {attempt}: found {len(current)}', flush=True)
+                  if len(current) > len(best):
+                      best = current
+                  if len(best) >= MAX_CAMPAIGNS:
+                      break
+                  page.wait_for_timeout(1700 * attempt)
+              if not best:
+                  print('No campaigns detected; no spreadsheet changes will be made.', flush=True)
+              elif len(best) < MAX_CAMPAIGNS:
+                  print(f'Continuing with {len(best)} available campaign(s), not requiring five.', flush=True)
+              return best[:MAX_CAMPAIGNS]
+
+          def content_from_campaign(body, payloads, campaign_id):
+              candidates = []
+              def clean_key(key):
+                  return re.sub(r'[^a-z0-9]', '', str(key).lower())
+              def template_text(template):
+                  if not isinstance(template, dict):
+                      return ''
+                  parts = []
+                  for component in (template.get('components') or []):
+                      if not isinstance(component, dict):
                           continue
-                      # A button and its nested SVG may both trigger the same tooltip.
-                      # Group them by the element that owns the recorded interaction.
-                      key = candidate.evaluate('''el => {
-                          const owner = el.closest('button, a, [role="button"], [title], [data-bs-toggle="tooltip"], [data-toggle="tooltip"]') || el.closest('svg') || el;
-                          return Array.from(document.querySelectorAll('*')).indexOf(owner);
-                      }''')
-                      matched.setdefault(key, candidate)
-                  print('Overview hover candidates:', len(candidates), 'unmatched/unavailable:', skipped)
-                  if len(matched) != 1:
-                      raise RuntimeError('Recorded Reports icon cannot be identified uniquely inside Overview.')
-                  control = next(iter(matched.values()))
-              control.click()
-              page.get_by_text(re.compile(r'^Page Reports')).wait_for(timeout=45000)
-              wait_unique(page.get_by_text('Export Data', exact=True), 'Export Data', 45)
+                      text = component.get('text')
+                      if isinstance(text, str) and text.strip():
+                          parameters = (component.get('parameters') or [])
+                          for index, parameter in enumerate(parameters, 1):
+                              if isinstance(parameter, dict) and isinstance(parameter.get('text'), str):
+                                  text = text.replace('{{' + str(index) + '}}', parameter['text'])
+                          parts.append(text)
+                      for button in (component.get('buttons') or []):
+                          if isinstance(button, dict):
+                              label = button.get('text', '')
+                              url = button.get('url', '')
+                              if label or url:
+                                  parts.append(str(label) + (' — ' + str(url) if url else ''))
+                      for parameter in (component.get('parameters') or []):
+                          if isinstance(parameter, dict):
+                              for media_type in ('image', 'video', 'document'):
+                                  media = parameter.get(media_type)
+                                  if isinstance(media, dict) and media.get('link'):
+                                      parts.append(media_type.title() + ': ' + str(media['link']))
+                  return '\n\n'.join(parts)
+              def walk(value):
+                  if isinstance(value, list):
+                      for item in value:
+                          walk(item)
+                  elif isinstance(value, dict):
+                      ids = [str(v) for k, v in value.items() if clean_key(k) in {'id', 'campaignid', 'broadcastid'} and not isinstance(v, (dict, list))]
+                      if campaign_id in ids and not any(clean_key(k) in {'messageid', 'recipientid', 'contactid', 'phone', 'phonenumber'} for k in value):
+                          # Read text only from a campaign with the matching ID.
+                          for key, item in value.items():
+                              normalized = clean_key(key)
+                              if normalized in {'renderedmessage', 'messagecontent', 'messagetext', 'broadcastcontent', 'message'} and isinstance(item, str) and item.strip():
+                                  candidates.append((0, item.strip(), 'Campaign response'))
+                              elif normalized in {'template', 'messagetemplate', 'templatecontent'}:
+                                  text = template_text(item)
+                                  if text:
+                                      candidates.append((1, text, 'Template components'))
+                      for item in value.values():
+                          if isinstance(item, (dict, list)):
+                              walk(item)
+              for payload in payloads:
+                  walk(payload)
+              # Fallback to an explicitly labelled content block, not the whole
+              # analytics page. Stop at the next known analytics section.
+              lines = body.splitlines()
+              for index, line in enumerate(lines):
+                  if re.fullmatch(r'\s*(?:Message Content|Broadcast Content|Message Preview|Template Message)\s*:?\s*', line, re.I):
+                      parts = []
+                      for following in lines[index + 1:]:
+                          if re.fullmatch(r'\s*(?:Campaign Type|Campaign Name|Created At|Sent At|Total Credit Usage|Audience|Sent|Delivered|Read|Failed|Analytics|Campaign Details|Message Statistics|Status)\s*:?\s*', following, re.I):
+                              break
+                          parts.append(following)
+                      text = '\n'.join(parts).strip()
+                      if text:
+                          candidates.append((2, text, 'Labelled message preview'))
+              if not candidates:
+                  return '', 'Content unavailable', ''
+              candidates.sort(key=lambda item: item[0])
+              priority = candidates[0][0]
+              best = [item for item in candidates if item[0] == priority]
+              if len({item[1] for item in best}) != 1:
+                  return '', 'Conflicting content; previous value retained', ''
+              _, text, source = best[0]
+              status = 'Template placeholders remain' if re.search(r'{{.*?}}', text) else 'Captured'
+              return text, status, source
 
-
-          def choose_recorded_custom_range(page):
-              # The recording establishes visible labels, not the underlying DOM type.
-              # Support either a native select or the same observed custom control.
-              custom_pattern = re.compile(r'^\s*Custom\s+range\s*$', re.IGNORECASE)
-              all_time_pattern = re.compile(r'^\s*All\s+Time\s*$', re.IGNORECASE)
-              deadline = time.monotonic() + 30
-              while time.monotonic() < deadline:
-                  selects = []
-                  for item in visible_items(page.locator('select')):
-                      options = item.locator('option')
-                      matching = [options.nth(i) for i in range(options.count())
-                                  if custom_pattern.fullmatch(options.nth(i).inner_text())]
-                      if len(matching) == 1:
-                          selects.append((item, matching[0]))
-                  if len(selects) > 1:
-                      raise RuntimeError('Multiple native date dropdowns; stopping.')
-                  if selects:
-                      select, option = selects[0]
-                      value = option.get_attribute('value')
-                      if value is None:
-                          select.select_option(label=option.inner_text())
-                      else:
-                          select.select_option(value=value)
-                      print('Custom range selected using native date dropdown.')
+          @contextmanager
+          def content_responses(page):
+              # Content may load from template endpoints, not campaign endpoints.
+              # This collector is separate from the unchanged timestamp collector.
+              payloads = []
+              def capture(response):
+                  if len(payloads) >= 150 or response.request.resource_type not in ('xhr', 'fetch'):
                       return
+                  if not re.match(r'https://(?:[A-Za-z0-9-]+\.)*aisensy\.com/', response.url, re.I):
+                      return
+                  try:
+                      if response.ok and 'json' in response.headers.get('content-type', '').lower():
+                          value = response.json()
+                          if isinstance(value, (dict, list)):
+                              payloads.append(value)
+                  except Exception:
+                      pass
+              page.on('response', capture)
+              try:
+                  yield payloads
+              finally:
+                  page.remove_listener('response', capture)
 
-                  trigger = first_unique_visible([
-                      page.get_by_role('combobox', name=all_time_pattern),
-                      page.get_by_role('button', name=all_time_pattern),
-                      page.get_by_text(all_time_pattern),
-                  ])
-                  if trigger is not None:
-                      trigger.click(timeout=15000)
-                      option_deadline = time.monotonic() + 15
-                      while time.monotonic() < option_deadline:
-                          option = first_unique_visible([
-                              page.get_by_role('option', name=custom_pattern),
-                              page.get_by_role('menuitem', name=custom_pattern),
-                              page.get_by_text(custom_pattern),
-                          ])
-                          if option is not None:
-                              option.click(timeout=15000)
-                              print('Custom range selected using visible All Time control.')
-                              return
-                          time.sleep(0.25)
-                      raise RuntimeError('All Time opened, but Custom range was not uniquely visible.')
-                  time.sleep(0.25)
-              print('Visible native date selects:', len(visible_items(page.locator('select'))))
-              print('Visible All Time matches:', len(visible_items(page.get_by_text(all_time_pattern))))
-              raise RuntimeError('Recorded All Time date control is missing or ambiguous.')
+          def linked_template_content(payloads, campaign_id):
+              def key(value):
+                  return re.sub(r'[^a-z0-9]', '', str(value).lower())
+              objects = []
+              def walk(value):
+                  if isinstance(value, list):
+                      for item in value:
+                          walk(item)
+                  elif isinstance(value, dict):
+                      objects.append(value)
+                      for item in value.values():
+                          if isinstance(item, (dict, list)):
+                              walk(item)
+              for payload in payloads:
+                  walk(payload)
+              campaigns = [obj for obj in objects if campaign_id in [str(v) for k, v in obj.items() if key(k) in {'id', 'campaignid', 'broadcastid'} and not isinstance(v, (dict, list))]
+                           and not any(key(k) in {'messageid', 'contactid', 'recipientid', 'phone', 'phonenumber'} for k in obj)]
+              references = set()
+              templates = []
+              parameters = []
+              for campaign in campaigns:
+                  for k, value in campaign.items():
+                      if key(k) in {'template', 'templateid', 'templatename', 'messagetemplate', 'templatedata', 'templatecontent'}:
+                          if isinstance(value, dict):
+                              templates.append(value)
+                              references.update(str(v) for k2, v in value.items() if key(k2) in {'id', 'name', 'templatename', 'templateid'} and isinstance(v, str))
+                          elif isinstance(value, str):
+                              references.add(value)
+                      if key(k) in {'templateparams', 'templateparameters', 'bodyparameters', 'parameters'} and isinstance(value, list):
+                          parameters.append(value)
+              # Join template objects only by an exact campaign reference.
+              for obj in objects:
+                  identities = {str(v) for k, v in obj.items() if key(k) in {'id', 'name', 'templatename', 'templateid'} and isinstance(v, str)}
+                  if identities & references:
+                      templates.append(obj)
+              rendered = set()
+              for template in templates:
+                  parts = []
+                  for field in ('header', 'body', 'footer'):
+                      value = template.get(field)
+                      if isinstance(value, dict):
+                          value = value.get('text')
+                      if isinstance(value, str) and value.strip():
+                          parts.append(value.strip())
+                  components = template.get('components') or template.get('templateComponents') or []
+                  if isinstance(components, list):
+                      for component in components:
+                          if not isinstance(component, dict):
+                              continue
+                          text = component.get('text')
+                          if isinstance(text, str) and text.strip():
+                              parts.append(text.strip())
+                          buttons = component.get('buttons') or []
+                          if isinstance(buttons, list):
+                              for button in buttons:
+                                  if isinstance(button, dict) and button.get('text'):
+                                      parts.append(str(button['text']) + (' — ' + str(button['url']) if button.get('url') else ''))
+                  if not parts:
+                      for field in ('content', 'text', 'message'):
+                          value = template.get(field)
+                          if isinstance(value, str) and value.strip():
+                              parts.append(value.strip())
+                              break
+                  text = '\n\n'.join(parts)
+                  if text:
+                      # Substitute only a single unambiguous campaign parameter list.
+                      if len(parameters) == 1:
+                          for index, value in enumerate(parameters[0], 1):
+                              value = value.get('text') if isinstance(value, dict) else value
+                              if isinstance(value, str):
+                                  text = text.replace('{{' + str(index) + '}}', value)
+                      rendered.add(text)
+              if len(rendered) == 1:
+                  text = next(iter(rendered))
+                  status = 'Template placeholders remain' if re.search(r'{{.*?}}|\$FirstName|\$Name', text, re.I) else 'Captured template text'
+                  return text, status, 'Campaign-linked template response'
+              return '', 'Content unavailable', ''
 
+          def content_from_preview(page):
+              # The sent message is the white preview card shown below Overview.
+              # It contains prose, external links and optionally a video/image.
+              return page.evaluate(r"""() => {
+                  const forbidden = /(?:^|\n)\s*(?:Campaign Type|Total Credit Usage|Campaign Messages \(per day\)|Rows per page:|Created At|Campaign Duration|Template Name)\s*(?:\n|$)/i;
+                  const seeds = [];
+                  for (const el of document.querySelectorAll('video,video source,a[href],img')) {
+                      const url = el.currentSrc || el.src || el.href || '';
+                      if (el.tagName === 'VIDEO' || el.tagName === 'SOURCE') seeds.push({el,priority:0});
+                      else if (el.tagName === 'A' && /^https?:/.test(url) && !/(?:^|\.)aisensy\.com$/.test(new URL(url).hostname)) seeds.push({el,priority:1});
+                      else if (el.tagName === 'IMG' && !/logo|icon|avatar/i.test(url)) seeds.push({el,priority:2});
+                  }
+                  // Text-only broadcasts have no media; locate their greeting.
+                  for (const el of document.querySelectorAll('p,div,span')) {
+                      const text = (el.innerText || '').trim();
+                      if (/^(?:Dear|Hi|Hello)\b/i.test(text) && text.length >= 80 && !forbidden.test(text)) seeds.push({el,priority:0});
+                  }
+                  const candidates = [];
+                  for (const seed of seeds) {
+                      let el = seed.el;
+                      for (let i=0; el && i<10; i++,el=el.parentElement) {
+                          if (el.tagName === 'BODY' || el.tagName === 'HTML') break;
+                          if (!el.getClientRects().length) continue;
+                          const text = (el.innerText || '').trim();
+                          if (text.length < 80 || text.length > 48000 || forbidden.test(text)) continue;
+                          if (/^(?:Manage|Live Chat|Contacts|Campaigns|History|All Projects)(?:\n|$)/i.test(text)) continue;
+                          const links = Array.from(el.querySelectorAll('a[href]')).map(a=>a.href).filter(u=>/^https?:/.test(u));
+                          const media = Array.from(el.querySelectorAll('video,video source,img[src]')).map(a=>a.currentSrc || a.src).filter(u=>u && /^https?:/.test(u) && !/logo|icon|avatar|whatsapp/i.test(u));
+                          candidates.push({text,priority:seed.priority,urls:[...new Set([...links,...media])]});
+                      }
+                  }
+                  if (!candidates.length) return '';
+                  const bestPriority = Math.min(...candidates.map(c=>c.priority));
+                  const ranked = candidates.filter(c=>c.priority === bestPriority).sort((a,b)=>b.text.length-a.text.length);
+                  const best = ranked[0];
+                  // Compare the text before appending URLs; media ancestors can
+                  // otherwise look like conflicting candidates for the same card.
+                  if (!ranked.every(c=>best.text.includes(c.text))) return '';
+                  let result = best.text;
+                  for (const url of best.urls) if (!result.includes(url)) result += '\n' + url;
+                  return result;
+              }""")
 
-          def recorded_calendar(page):
-              ok = wait_unique(page.get_by_text(re.compile(r'^\s*OK\s*$', re.IGNORECASE)), 'Calendar OK')
-              # The recording shows Monday-first weekday labels Mo ... Su.
-              calendar = ok.locator("xpath=ancestor::*[.//*[normalize-space(.)='Mo'] and .//*[normalize-space(.)='Su']][1]")
-              if calendar.count() != 1 or not calendar.is_visible():
-                  raise RuntimeError('Calendar with the recorded Mo–Su weekday header not uniquely identified.')
-              return calendar
+          def fetch_broadcast_content(page, payloads, campaign_id):
+              try:
+                  # Scrolling loads lazy-rendered previews below the overview cards.
+                  page.evaluate('''() => {
+                      window.scrollTo(0, document.body.scrollHeight);
+                      for (const el of document.querySelectorAll('main,section,div')) {
+                          const overflow = getComputedStyle(el).overflowY;
+                          if (/(auto|scroll)/.test(overflow) && el.scrollHeight > el.clientHeight) {
+                              el.scrollTop = el.scrollHeight;
+                          }
+                      }
+                  }''')
+                  page.wait_for_timeout(800)
+                  text = content_from_preview(page)
+                  if text:
+                      status = 'Template placeholders remain' if re.search(r'{{.*?}}|\$FirstName|\$Name', text, re.I) else 'Captured preview'
+                      return text, status, 'AiSensy WhatsApp message preview'
+                  result = content_from_campaign(page.locator('body').inner_text(), payloads, campaign_id)
+                  if result[0]:
+                      return result
+                  result = linked_template_content(payloads, campaign_id)
+                  if result[0]:
+                      return result
+                  print(f'Content preview/template unavailable for {campaign_id}; preserving any previous message.', flush=True)
+                  return '', 'Content unavailable', ''
+              except Exception as exc:
+                  print(f'Optional content extraction failed for {campaign_id}: {type(exc).__name__}', flush=True)
+                  return '', 'Content lookup failed; previous value retained', ''
 
-
-          def calendar_month(calendar):
-              names = 'January February March April May June July August September October November December'.split()
-              pattern = r'\b(' + '|'.join(name[:3] + '(?:' + name[3:] + ')?' for name in names) + r')\s+(\d{4})\b'
-              matches = re.findall(pattern, calendar.inner_text(), re.IGNORECASE)
-              values = {(int(year), next(i + 1 for i, name in enumerate(names) if name[:3].lower() == month[:3].lower()))
-                        for month, year in matches}
-              if len(values) != 1:
-                  raise RuntimeError('Calendar month/year header is missing or ambiguous.')
-              return next(iter(values))
-
-
-          def click_calendar_date(page, target):
-              calendar = recorded_calendar(page)
-              expected_month = (target.year, target.month)
-              for _ in range(24):
-                  shown = calendar_month(calendar)
-                  if shown == expected_month:
-                      break
-                  previous = shown > expected_month
-                  direction = re.compile(r'previous|prev|back', re.IGNORECASE) if previous else re.compile(r'next|forward', re.IGNORECASE)
-                  navigation = first_unique_visible([
-                      calendar.get_by_role('button', name=direction),
-                      calendar.locator('[title]').filter(has_text=direction),
-                  ])
-                  if navigation is None:
-                      # Inspect only semantic labels on calendar controls, not global UI.
-                      labeled = []
-                      for control in visible_items(calendar.locator('button, [role="button"], [aria-label], [title]')):
-                          label = ' '.join(control.get_attribute(attr) or '' for attr in ('aria-label', 'title'))
-                          if direction.search(label):
-                              labeled.append(control)
-                      if len(labeled) == 1:
-                          navigation = labeled[0]
-                  if navigation is None:
-                      raise RuntimeError('Calendar month arrow lacks a unique directional label; stopping.')
-                  navigation.click()
-                  deadline = time.monotonic() + 5
-                  while time.monotonic() < deadline:
-                      calendar = recorded_calendar(page)
-                      if calendar_month(calendar) != shown:
-                          break
-                      time.sleep(0.1)
+          def fetch_campaign(page, name, campaign_id=None):
+              with campaign_responses(page) as payloads, content_responses(page) as content_payloads:
+                  if campaign_id:
+                      page.goto(f'{LIST_URL}/view/{campaign_id}', wait_until='domcontentloaded', timeout=30000)
+                      page.wait_for_url(re.compile(rf'/campaigns/all/view/{re.escape(campaign_id)}(?:[/?#]|$)'), timeout=30000)
                   else:
-                      raise RuntimeError('Calendar month did not change after navigation.')
-              else:
-                  raise RuntimeError('Requested calendar month was not reached.')
+                      wait_for_list(page)
+                      target = page.get_by_text(name, exact=True).first
+                      target.wait_for(timeout=20000)
+                      target.click(timeout=20000)
+                      page.wait_for_url(re.compile(r'/campaigns/all/view/[A-Za-z0-9]+'), timeout=30000)
+                  page.get_by_text('Total Credit Usage', exact=True).first.wait_for(timeout=30000)
+                  page.wait_for_timeout(500)
+                  campaign_id = re.search(r'/view/([A-Za-z0-9]+)', page.url).group(1)
+                  body = page.locator('body').inner_text()
+                  values = {
+                      'Audience Size': metric(body, 'Audience'),
+                      'Sent': metric(body, 'Sent'),
+                      'Delivered': metric(body, 'Delivered'),
+                      'Read': metric(body, 'Read'),
+                      'Failed': failed_count(body),
+                      'Actual Cost': money(body),
+                  }
+                  missing = [key for key, value in values.items() if value is None]
+                  if missing:
+                      raise RuntimeError(f'Missing metrics for {name}: {missing}')
+                  if contents_by_id.get(campaign_id, {}).get('Message Content') and 'placeholder' not in str(contents_by_id[campaign_id].get('Content Status', '')).lower():
+                      message_content, content_status, content_source = '', '', ''
+                  else:
+                      message_content, content_status, content_source = fetch_broadcast_content(page, content_payloads, campaign_id)
+                  kind = re.search(r'(?im)^\s*Campaign Type\s*\n\s*([A-Z_]+)', body)
+                  record = {
+                      'Campaign ID': campaign_id,
+                      'Campaign Name': name,
+                      'Date': date_from_body(body),
+                      'Displayed Campaign Time (IST)': displayed_campaign_time(body),
+                      'Broadcast Sent At (IST)': resolve_sent_time(body, payloads, campaign_id),
+                      'Campaign Type': kind.group(1) if kind else 'BROADCAST',
+                      **values,
+                      'Cost per Message': (values['Actual Cost'] / values['Sent']) if values['Sent'] else 0.0,
+                      'Estimated Cost': '',
+                      'Last Updated': ist_now(),
+                      'Message Content': message_content,
+                      'Content Status': content_status,
+                      'Content Source': content_source,
+                  }
+                  if not record['Broadcast Sent At (IST)']:
+                      print(f'No usable explicit sent timestamp for {name}; retaining any historical value.', flush=True)
+                  print(f"Fetched {name}: sent={record['Sent']}, delivered={record['Delivered']}, cost=INR {record['Actual Cost']}", flush=True)
+                  return record
 
-              # Match the actual visible day number within the confirmed month. Exclude
-              # explicitly disabled cells and fail if adjacent-month cells are ambiguous.
-              day = re.compile(r'^\s*' + str(target.day) + r'\s*$')
-              candidates = visible_items(calendar.get_by_text(day))
-              candidates = [item for item in candidates if item.is_enabled() and not item.evaluate(
-                  "el => !!el.closest('[aria-disabled=\"true\"], [disabled]')")]
-              if len(candidates) != 1:
-                  raise RuntimeError('Calendar day ' + target.isoformat() + ' is missing or ambiguous.')
-              candidates[0].click()
-              print('Calendar date clicked:', target.isoformat())
+          def existing_record(row):
+              padded = list(row[:15]) + [''] * max(0, 15 - len(row))
+              rec = dict(zip(HEADERS, padded))
+              for field in ('Audience Size', 'Sent', 'Delivered', 'Read', 'Failed'):
+                  rec[field] = count(rec[field])
+              for field in ('Cost per Message', 'Estimated Cost', 'Actual Cost'):
+                  rec[field] = number(rec[field])
+              rec['Last Updated'] = existing_time_to_ist(rec.get('Last Updated', ''))
+              rec['Campaign ID'] = str(rec['Campaign ID']).strip()
+              # Migrate a timestamp column from earlier versions before clearing it.
+              rec['Broadcast Sent At (IST)'] = str(row[15]).strip() if len(row) > 15 else ''
+              if not rec['Broadcast Sent At (IST)'] and ':' in str(rec['Date']):
+                  rec['Broadcast Sent At (IST)'] = str(rec['Date'])
+              return rec
 
+          def output_row(rec):
+              sent, delivered, read = count(rec['Sent']), count(rec['Delivered']), count(rec['Read'])
+              rate = number(rec['Actual Cost']) / sent if sent else 0.0
+              return [
+                  rec['Campaign ID'], rec['Campaign Name'], date_with_time(rec), rec['Campaign Type'],
+                  count(rec['Audience Size']), sent, delivered, read, count(rec['Failed']),
+                  delivered / sent if sent else 0, read / delivered if delivered else 0,
+                  rate, '', number(rec['Actual Cost']), rec['Last Updated'],
+              ]
 
-          def verify_calendar_preview(page):
-              calendar = recorded_calendar(page)
-              deadline = time.monotonic() + 10
-              while time.monotonic() < deadline:
-                  values = [field.input_value() for field in visible_items(calendar.locator('input'))]
-                  preview = calendar.inner_text() + ' ' + ' '.join(values)
-                  selected = re.findall(r'\b\d{4}-\d{2}-\d{2}\b', preview)
-                  if selected == [yesterday.isoformat(), today.isoformat()]:
-                      print('Calendar start/end preview verified.')
-                      return
-                  time.sleep(0.25)
-              raise RuntimeError('Calendar preview does not confirm yesterday through today.')
+          def ensure_rows(ws, minimum):
+              if ws.row_count < minimum:
+                  ws.add_rows(minimum - ws.row_count)
 
+          def update_values(ws, range_name, rows):
+              ws.update(range_name=range_name, values=rows, value_input_option='RAW')
 
-          def save_calendar_diagnostic(page):
-              # Capture only the calendar, excluding report rows and customer information.
+          def same_cell(old, new):
+              if str(old or '') == str(new if new is not None else ''):
+                  return True
+              if isinstance(new, (int, float)) and not isinstance(new, bool):
+                  try:
+                      return abs(float(old) - new) <= 1e-9 * max(1, abs(new))
+                  except (ValueError, TypeError):
+                      pass
+              return False
+
+          def chronological_time(value):
+              value = str(value or '').strip()
+              for fmt in ('%Y-%m-%d %I:%M:%S %p IST', '%Y-%m-%d'):
+                  try:
+                      return datetime.strptime(value, fmt).replace(tzinfo=IST).timestamp()
+                  except ValueError:
+                      pass
               try:
-                  calendar = recorded_calendar(page)
-                  Path('diagnostics').mkdir(exist_ok=True)
-                  calendar.screenshot(path='diagnostics/calendar.png')
-                  data = calendar.locator('input, button, [role="button"], [role="gridcell"], [aria-label], [title]').evaluate_all('''xs => xs.map(el => ({
-                      tag: el.tagName, role: el.getAttribute('role'),
-                      ariaLabel: el.getAttribute('aria-label'), title: el.getAttribute('title'),
-                      disabled: el.getAttribute('aria-disabled'), readonly: el.hasAttribute('readonly'),
-                      text: (el.innerText || '').trim().slice(0, 100)
-                  }))''')
-                  import json
-                  Path('diagnostics/calendar-controls.json').write_text(json.dumps(data, indent=2))
-                  print('Calendar-only diagnostics saved.')
-              except Exception:
-                  print('Calendar-only diagnostics unavailable.')
+                  parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+                  return parsed.replace(tzinfo=parsed.tzinfo or IST).timestamp()
+              except ValueError:
+                  return float('-inf')
 
+          def newest_activity(rec):
+              return max(chronological_time(date_with_time(rec)), chronological_time(rec.get('Last Updated')))
 
-          def set_recorded_date_range(page):
-              # At 14–15 seconds in the recording, clicking Filters reveals All Time.
-              # Each published URL is opened afresh before this function is called.
-              click_text(page, 'Filters')
-              print('Filters clicked; waiting for the date control to appear.')
-              choose_recorded_custom_range(page)
-              # Wait for the date picker to appear after selection instead of inspecting
-              # it immediately while the report UI is still updating.
-              deadline = time.monotonic() + 30
-              picker = None
-              while time.monotonic() < deadline:
-                  picker = first_unique_visible([
-                      page.locator('input[placeholder="Select Date Range"]'),
-                      page.get_by_text('Select Date Range', exact=True),
-                  ])
-                  if picker is not None:
-                      break
-                  time.sleep(0.25)
-              if picker is None:
-                  raise RuntimeError('Custom range selected, but Select Date Range did not appear.')
-              picker.click()
+          def historical_batch(ids, cursor, limit):
+              ids = sorted(set(ids))
+              if not ids:
+                  return [], ''
+              start = ids.index(cursor) if cursor in ids else next((i for i, cid in enumerate(ids) if cid > cursor), 0)
+              size = min(limit, len(ids))
+              selected = [ids[(start + i) % len(ids)] for i in range(size)]
+              return selected, ids[(start + size) % len(ids)]
 
-              try:
-                  click_calendar_date(page, yesterday)
-                  click_calendar_date(page, today)
-                  verify_calendar_preview(page)
-                  wait_unique(page.get_by_text(re.compile(r'^\s*OK\s*$', re.IGNORECASE)), 'Calendar OK').click()
-              except Exception:
-                  save_calendar_diagnostic(page)
-                  raise
-              expected = yesterday.isoformat() + ' to ' + today.isoformat()
-              deadline = time.monotonic() + 45
-              while time.monotonic() < deadline:
-                  values = [x.input_value() for x in visible_items(page.locator('input'))]
-                  if expected in values or unique_visible(page.get_by_text(expected, exact=True)):
-                      # Wait for report loading to settle; range display alone is insufficient.
-                      page.wait_for_timeout(2000)
-                      count_text = page.get_by_text(re.compile(r'^Page Reports')).inner_text()
-                      match = re.search(r'\[(\d+)\]', count_text)
-                      if match:
-                          return int(match.group(1))
-                  time.sleep(0.5)
-              raise RuntimeError('Applied report date range/count could not be verified.')
+          def sort_campaign_rows(ws, positions, desired_ids):
+              # Move whole rows so custom notes/columns stay with their campaign.
+              last_row = max(positions.values(), default=1)
+              by_row = {index: cid for cid, index in positions.items()}
+              current = [by_row.get(index, ('blank', index)) for index in range(2, last_row + 1)]
+              requests = []
+              for target, cid in enumerate(desired_ids):
+                  source = current.index(cid)
+                  if source == target:
+                      continue
+                  # Earlier desired rows are already fixed; every move is upward.
+                  requests.append({'moveDimension': {
+                      'source': {'sheetId': ws.id, 'dimension': 'ROWS',
+                                 'startIndex': source + 1, 'endIndex': source + 2},
+                      'destinationIndex': target + 1,
+                  }})
+                  current.insert(target, current.pop(source))
+              for start in range(0, len(requests), 100):
+                  spreadsheet.batch_update({'requests': requests[start:start+100]})
 
+          def upsert_table(ws, headers, rows, end_col):
+              # Campaign ID is the key. Refresh changed cells, append new IDs, then sort whole rows.
+              existing = ws.get_all_values()
+              positions = {}
+              for index, row in enumerate(existing[1:], 2):
+                  if row and str(row[0]).strip():
+                      cid = str(row[0]).strip()
+                      if cid in positions:
+                          raise RuntimeError(f'Duplicate Campaign ID in {ws.title}: {cid}; table was not rewritten.')
+                      positions[cid] = index
+              updates = []
+              if not existing or existing[0][:len(headers)] != headers:
+                  updates.append({'range': f'A1:{end_col}1', 'values': [headers]})
+              next_row = max(2, len(existing) + 1)
+              for row in rows:
+                  cid = str(row[0]).strip()
+                  index = positions.get(cid)
+                  if index is None:
+                      index = next_row
+                      next_row += 1
+                      positions[cid] = index
+                      updates.append({'range': f'A{index}:{end_col}{index}', 'values': [row]})
+                  else:
+                      old = existing[index-1][:len(headers)]
+                      old += [''] * (len(headers) - len(old))
+                      if not all(same_cell(a, b) for a, b in zip(old, row)):
+                          updates.append({'range': f'A{index}:{end_col}{index}', 'values': [row]})
+              ensure_rows(ws, max(positions.values(), default=1))
+              # Bound request size while retaining unrelated cells and columns.
+              for start in range(0, len(updates), 100):
+                  ws.batch_update(updates[start:start+100], value_input_option='RAW')
+              sort_campaign_rows(ws, positions, [str(row[0]).strip() for row in rows])
 
-          def download_rows(page):
-              # Use table rows containing the recorded "Filter: Custom" marker.
-              return page.get_by_role('row').filter(has_text='Filter: Custom')
+          session_json = os.environ.get('AISENSY_SESSION', '').strip()
+          google_json = (os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '').strip()
+                         or os.environ.get('GOOGLE_CREDENTIALS', '').strip())
+          if not session_json:
+              raise RuntimeError('Missing AISENSY_SESSION secret')
+          if not google_json:
+              raise RuntimeError('Missing GOOGLE_SERVICE_ACCOUNT_JSON secret')
+          session = json.loads(session_json)
+          credentials = Credentials.from_service_account_info(
+              json.loads(google_json), scopes=['https://www.googleapis.com/auth/spreadsheets'])
+          spreadsheet = gspread.authorize(credentials).open_by_key(SHEET_ID)
+          data_ws = spreadsheet.worksheet('Broadcast_Data')
+          summary_ws = spreadsheet.worksheet('Cost Summary')
+          dashboard_ws = spreadsheet.worksheet('Dashboard')
 
+          sheets_by_title = {ws.title: ws for ws in spreadsheet.worksheets()}
+          sync_metadata = spreadsheet.fetch_sheet_metadata()
+          cursor_entries = [entry for entry in sync_metadata.get('developerMetadata', [])
+                            if entry.get('metadataKey') == 'aisensy_history_cursor']
+          cursor_entry = cursor_entries[0] if cursor_entries else None
+          history_cursor = cursor_entry.get('metadataValue', '') if cursor_entry else ''
+          next_history_cursor = history_cursor
 
-          def export_current_report(page, label, count):
-              click_text(page, 'Downloads')
-              page.get_by_text('FILE DETAILS', exact=True).wait_for(timeout=30000)
-              before = download_rows(page).all_text_contents()
-              click_text(page, 'Reports')
-              wait_unique(page.get_by_text('Export Data', exact=True), 'Export Data').click()
-              click_text(page, 'Filtered Data')
-              click_text(page, 'Downloads')
-              deadline = time.monotonic() + 600
-              seen_new = False
-              while time.monotonic() < deadline:
-                  rows = download_rows(page)
-                  texts = rows.all_text_contents()
-                  if texts:
-                      # Recorded exports prepend to Downloads. Require evidence of a new
-                      # row, so an old Completed export cannot be downloaded by mistake.
-                      normalize = lambda s: re.sub(r'Pending|Completed|Queued\.\.\.|Download', '', s).strip()
-                      if len(texts) > len(before) or not before or normalize(texts[0]) != normalize(before[0]):
-                          seen_new = True
-                      first = rows.first
-                      if seen_new:
-                          cells = first.get_by_role('cell')
-                          if cells.count() < 5:
-                              raise RuntimeError('Downloads columns differ from the recording.')
-                          if cells.nth(1).inner_text().strip() != str(count):
-                              raise RuntimeError('New export record count differs from filtered report.')
-                          status = cells.nth(2).inner_text().strip()
-                          if status == 'Completed':
-                              with page.expect_download(timeout=60000) as event:
-                                  wait_unique(first.get_by_text('Download', exact=True), 'new export Download').click()
-                              download = event.value
-                              if download.failure():
-                                  raise RuntimeError('CSV download failed.')
-                              path = Path('reports') / (label + '.csv')
-                              download.save_as(str(path))
-                              with path.open(encoding='utf-8-sig', newline='') as source:
-                                  reader = csv.reader(source)
-                                  header = next(reader, None)
-                                  total = sum(1 for row in reader if any(row))
-                              if not header or total != count:
-                                  raise RuntimeError('Downloaded CSV row count does not match report.')
-                              print(label + ': CSV verified; records=' + str(total))
-                              return
-                          if status not in ('Pending', 'Processing', 'Queued'):
-                              raise RuntimeError('Unexpected export status; stopping.')
-                  time.sleep(2)
-              raise RuntimeError('New export did not complete within 10 minutes. No refresh attempted.')
+          analysis_ws = sheets_by_title.get('Broadcast Analysis')
+          source_times = read_analysis_times(analysis_ws) if analysis_ws else {}
+          contents_ws = sheets_by_title.get('Broadcast Contents')
+          contents_by_id = {}
+          if contents_ws:
+              for row in contents_ws.get_all_records():
+                  cid = str(row.get('Campaign ID', '')).strip()
+                  if cid:
+                      contents_by_id[cid] = row
 
+          webinar_ws = sheets_by_title.get('Webinar Dashboard')
+          if analysis_ws is None and webinar_ws is None:
+              raise RuntimeError('Neither Webinar Dashboard nor Broadcast Analysis exists; no spreadsheet changes were made.')
 
-          Path('reports').mkdir(exist_ok=True)
+          existing_rows = data_ws.get_all_values()
+          existing_by_id = {}
+          order = []
+          for row in existing_rows[1:]:
+              if not row or not row[0].strip():
+                  continue
+              rec = existing_record(row)
+              cid = rec['Campaign ID']
+              if not rec['Broadcast Sent At (IST)']:
+                  rec['Broadcast Sent At (IST)'] = source_times.get(cid, '')
+              if cid not in existing_by_id:
+                  order.append(cid)
+              existing_by_id[cid] = rec
+          print(f'Historical campaigns retained: {len(order)}', flush=True)
+
+          fetched = []
           with sync_playwright() as playwright:
               browser = playwright.chromium.launch(headless=True)
-              context = browser.new_context(viewport={'width': 1440, 'height': 900}, accept_downloads=True, timezone_id=TIMEZONE)
+              context = browser.new_context(storage_state=session, timezone_id='Asia/Kolkata')
               page = context.new_page()
-              page.set_default_timeout(15000)
-              try:
-                  login(page)
-                  select_saurabh(page)
-                  page = locate_switched_page(context, page)
-                  page.set_default_timeout(15000)
-                  for label, published_url in [('funnel-agent', LANDING_URL), ('flexi-genie-regteam', REG_URL)]:
-                      open_projects(page)
-                      select_published_url(page)
-                      search_published_url(page, published_url)
-                      verify_overview(page, published_url)
-                      open_recorded_reports(page, published_url)
-                      count = set_recorded_date_range(page)
-                      export_current_report(page, label, count)
-                  print('VERSION 14: both CSVs verified; Google Sheets remain read-only.')
-              except Exception as error:
-                  print('VERSION 14 stopped:', type(error).__name__, str(error))
-                  raise RuntimeError('Report automation failed; no fallback export was attempted.') from None
-              finally:
-                  browser.close()
+              names = discover_names(page)
+              for name in names:
+                  try:
+                      fetched.append(fetch_campaign(page, name))
+                  except Exception as exc:
+                      print(f'WARNING: Skipped {name}: {exc}', flush=True)
+              # At most five older campaigns per run, rotating across all history.
+              fetched_ids = {rec['Campaign ID'] for rec in fetched}
+              candidates = [cid for cid in order if cid not in fetched_ids and re.fullmatch(r'[A-Za-z0-9]+', cid)]
+              selected, next_history_cursor = historical_batch(candidates, history_cursor, HISTORICAL_BATCH_SIZE)
+              print(f'Historical refresh: {len(selected)} of {len(candidates)} saved campaigns this run.', flush=True)
+              for cid in selected:
+                  try:
+                      rec = fetch_campaign(page, existing_by_id[cid]['Campaign Name'], campaign_id=cid)
+                      fetched.append(rec)
+                  except Exception as exc:
+                      print(f'WARNING: Historical campaign {cid} could not be refreshed; saved row retained: {exc}', flush=True)
+              browser.close()
 
+          if not names:
+              raise RuntimeError('AiSensy campaign list returned no names. Session may have expired or the page changed; spreadsheet was not modified.')
+          if not fetched:
+              raise RuntimeError('AiSensy campaigns were listed but none could be fetched. Spreadsheet was not modified.')
+          sync_time = ist_now()
+          new_ids = {rec['Campaign ID'] for rec in fetched if rec['Campaign ID'] not in existing_by_id}
+
+          # Refresh every successfully fetched campaign on every run.
+          # Retain historical campaigns that were not fetched this time.
+          if new_ids:
+              print(f'{len(new_ids)} new broadcast(s) found; refreshing fetched campaign metrics.', flush=True)
+          else:
+              print('No new broadcasts; refreshing fetched campaign metrics.', flush=True)
+
+          new_count = 0
+          updated_count = 0
+          for rec in fetched:
+              cid = rec['Campaign ID']
+              if not rec.get('Broadcast Sent At (IST)'):
+                  rec['Broadcast Sent At (IST)'] = source_times.get(cid, '')
+              if cid in existing_by_id:
+                  old = existing_by_id[cid]
+                  if not rec['Date']:
+                      rec['Date'] = old.get('Date', '')
+                  if not rec.get('Broadcast Sent At (IST)'):
+                      rec['Broadcast Sent At (IST)'] = old.get('Broadcast Sent At (IST)', '')
+                  if not rec.get('Broadcast Sent At (IST)'):
+                      rec['Broadcast Sent At (IST)'] = rec.get('Displayed Campaign Time (IST)', '')
+                  tracked_fields = ('Campaign Name', 'Campaign Type', 'Audience Size', 'Sent', 'Delivered', 'Read', 'Failed', 'Actual Cost', 'Broadcast Sent At (IST)')
+                  changed = date_with_time(rec) != date_with_time(old) or any(rec.get(field, '') != old.get(field, '') for field in tracked_fields)
+                  if changed:
+                      updated_count += 1
+                  else:
+                      rec['Last Updated'] = old.get('Last Updated', rec['Last Updated'])
+              else:
+                  if not rec.get('Broadcast Sent At (IST)'):
+                      rec['Broadcast Sent At (IST)'] = rec.get('Displayed Campaign Time (IST)', '')
+                  order.append(cid)
+                  new_count += 1
+              existing_by_id[cid] = rec
+
+          # New broadcasts and genuinely changed metrics rise to the top.
+          # Checking an unchanged campaign does not change its Last Updated time.
+          records = sorted(
+              (existing_by_id[cid] for cid in order),
+              key=lambda rec: (newest_activity(rec), chronological_time(date_with_time(rec)), rec['Campaign ID']),
+              reverse=True,
+          )
+          missing_source_ids = set(source_times) - set(existing_by_id)
+          if missing_source_ids:
+              raise RuntimeError('Source times include campaigns missing from Broadcast_Data; no cleanup was performed.')
+          data_rows = [output_row(rec) for rec in records]
+          upsert_table(data_ws, HEADERS, data_rows, 'O')
+          data_ws.format(f'C2:C{len(data_rows)+1}', {'numberFormat': {'type': 'TEXT'}})
+          data_ws.format(f'O2:O{len(data_rows)+1}', {'numberFormat': {'type': 'TEXT'}})
+          data_ws.format(f'E2:I{len(data_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
+          data_ws.format(f'J2:K{len(data_rows)+1}', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
+          data_ws.format(f'L2:L{len(data_rows)+1}', {'numberFormat': {'type': 'CURRENCY', 'pattern': '₹#,##0.000'}})
+          data_ws.format(f'N2:N{len(data_rows)+1}', {'numberFormat': {'type': 'CURRENCY', 'pattern': '₹#,##0.00'}})
+
+          summary_header = [
+              'Campaign ID', 'Campaign Name', 'Date', 'Audience', 'Sent', 'Delivered',
+              'Read', 'Failed', 'Actual Cost (INR)', 'Cost per Sent',
+              'Cost per Delivered', 'Last Updated',
+          ]
+          summary_rows = []
+          for rec in records:
+              sent = count(rec['Sent'])
+              delivered = count(rec['Delivered'])
+              cost = number(rec['Actual Cost'])
+              summary_rows.append([
+                  rec['Campaign ID'], rec['Campaign Name'], date_with_time(rec),
+                  count(rec['Audience Size']), sent, delivered, count(rec['Read']),
+                  count(rec['Failed']), cost, cost / sent if sent else 0,
+                  cost / delivered if delivered else 0, rec['Last Updated'],
+              ])
+          upsert_table(summary_ws, summary_header, summary_rows, 'L')
+          summary_ws.format(f'C2:C{len(summary_rows)+1}', {'numberFormat': {'type': 'TEXT'}})
+          summary_ws.format(f'L2:L{len(summary_rows)+1}', {'numberFormat': {'type': 'TEXT'}})
+          summary_ws.format(f'D2:H{len(summary_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
+          summary_ws.format(f'I2:K{len(summary_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0.000'}})
+
+          total_sent = sum(count(rec['Sent']) for rec in records)
+          total_delivered = sum(count(rec['Delivered']) for rec in records)
+          total_read = sum(count(rec['Read']) for rec in records)
+          total_failed = sum(count(rec['Failed']) for rec in records)
+          total_cost = sum(number(rec['Actual Cost']) for rec in records)
+          dashboard = [
+              ['Metric', 'Total'],
+              ['Total Broadcasts', len(records)],
+              ['Total Audience', sum(count(rec['Audience Size']) for rec in records)],
+              ['Total Messages Sent', total_sent],
+              ['Total Messages Delivered', total_delivered],
+              ['Total Messages Read', total_read],
+              ['Total Messages Failed', total_failed],
+              ['Total Estimated Cost', 'Not available from AiSensy'],
+              ['Total Actual Cost', total_cost],
+              ['Overall Delivery Rate', total_delivered / total_sent if total_sent else 0],
+              ['Overall Read Rate', total_read / total_delivered if total_delivered else 0],
+              ['Average Cost per Sent Message', total_cost / total_sent if total_sent else 0],
+              ['Last Sync (IST)', sync_time],
+              ['Campaigns Added This Sync', new_count, f'{new_count} new campaign(s) added; {updated_count} existing campaign(s) refreshed'],
+              ['CAMPAIGN PERFORMANCE'],
+              ['Campaign Name', 'Date', 'Sent', 'Delivered', 'Read', 'Failed', 'Delivery Rate', 'Read Rate', 'Actual Cost (INR)'],
+          ]
+          for rec in records:
+              sent, delivered, read = count(rec['Sent']), count(rec['Delivered']), count(rec['Read'])
+              dashboard.append([
+                  rec['Campaign Name'], date_with_time(rec), sent, delivered, read, count(rec['Failed']),
+                  delivered / sent if sent else 0, read / delivered if delivered else 0,
+                  number(rec['Actual Cost']),
+              ])
+          previous_dashboard = len(dashboard_ws.get_all_values())
+          ensure_rows(dashboard_ws, len(dashboard))
+          dashboard_ws.batch_clear([f'A1:O{max(previous_dashboard, len(dashboard))}'])
+          dashboard[12][1] = ist_now()  # Actual dashboard write time in IST
+          update_values(dashboard_ws, f'A1:I{len(dashboard)}', dashboard)
+          dashboard_ws.format('B13', {'numberFormat': {'type': 'TEXT'}})
+          dashboard_ws.format('B2:B7', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
+          dashboard_ws.format('B10:B11', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
+          dashboard_ws.format('B8:B9', {'numberFormat': {'type': 'CURRENCY', 'pattern': '₹#,##0.00'}})
+          if records:
+              dashboard_ws.format(f'B17:B{16+len(records)}', {'numberFormat': {'type': 'TEXT'}})
+              dashboard_ws.format(f'C17:F{16+len(records)}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
+              dashboard_ws.format(f'G17:H{16+len(records)}', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
+              dashboard_ws.format(f'I17:I{16+len(records)}', {'numberFormat': {'type': 'CURRENCY', 'pattern': '₹#,##0.00'}})
+
+          # Clear only the timestamp columns added by earlier replacements.
+          # Do not delete columns, which could shift unrelated references.
+          for ws, col, label in (
+              (data_ws, 'P', 'Broadcast Sent At (IST)'),
+              (summary_ws, 'M', 'Broadcast Sent At (IST)'),
+          ):
+              if ws.acell(f'{col}1').value == label:
+                  ws.batch_clear([f'{col}1:{col}{ws.row_count}'])
+
+          # Replace the first report in place. No schedule/settings tabs are created.
+          # If both report tabs exist, retain the existing Broadcast Analysis tab.
+          if analysis_ws is None:
+              if webinar_ws is None:
+                  raise RuntimeError('Neither Webinar Dashboard nor Broadcast Analysis exists; no new tab was created.')
+              webinar_ws.update_title('Broadcast Analysis')
+              analysis_ws = webinar_ws
+              webinar_ws = None
+
+          analysis_headers = [
+              'Campaign ID', 'Campaign Name', 'Audience Size', 'Sent', 'Delivered',
+              'Read', 'Failed', 'Actual Cost', 'Last Updated', 'Sent At (IST)',
+              'Send Day', 'Send Hour', 'Webinar Start (inferred)', 'Webinar (inferred)',
+              'Webinar Date (inferred)', 'Hours Before Start', 'Timing Stage (inferred)',
+              'Message Type', 'Content Angle', 'Delivery Rate', 'Read Rate',
+              'Cost per Read', 'Data Status', 'Ranked', 'Data Check',
+          ]
+          analysis_rows = []
+          for rec in records:
+              sent, delivered, read = count(rec['Sent']), count(rec['Delivered']), count(rec['Read'])
+              cost = number(rec['Actual Cost'])
+              stamp = rec.get('Broadcast Sent At (IST)', '')
+              try:
+                  local = datetime.strptime(stamp, '%Y-%m-%d %I:%M:%S %p IST').replace(tzinfo=IST)
+              except ValueError:
+                  local = None
+              name = rec['Campaign Name'].lower()
+              if 'renew' in name:
+                  message_type = 'Renewal offer'
+              elif any(word in name for word in ('live', 'started', 'joinnow')):
+                  message_type = 'Live now'
+              elif any(word in name for word in ('missed', 're-register', 'reregister')):
+                  message_type = 'Missed / re-register'
+              elif any(word in name for word in ('closing', 'deadline', 'lastchance', 'last chance')):
+                  message_type = 'Sales / closing'
+              else:
+                  message_type = 'Reminder'
+              angle = 'General'
+              for words, category in (
+                  (('closing', 'deadline', 'last chance'), 'Deadline / closing'),
+                  (('income', 'earn', 'salary'), 'Income'),
+                  (('bonus',), 'Bonus'), (('discount', 'offer'), 'Offer'),
+                  (('faceless',), 'Faceless'),
+              ):
+                  if any(word in name for word in words):
+                      angle = category
+                      break
+              webinar_start = None
+              if local and message_type != 'Renewal offer':
+                  candidates = []
+                  # Existing webinar schedule, kept in code rather than another tab.
+                  for offset in range(-1, 8):
+                      day = (local + timedelta(days=offset)).date()
+                      for weekday, hour, minute in ((6, 11, 0), (6, 19, 30), (1, 19, 30), (2, 19, 30)):
+                          if day.weekday() != weekday:
+                              continue
+                          start = datetime(day.year, day.month, day.day, hour, minute, tzinfo=IST)
+                          if start >= local - timedelta(minutes=90):
+                              candidates.append(start)
+                  if candidates:
+                      webinar_start = min(candidates)
+              hours_before = (webinar_start - local).total_seconds() / 3600 if webinar_start else ''
+              stage = ''
+              if webinar_start:
+                  if hours_before <= 0:
+                      stage = 'Live / after start'
+                  elif hours_before < 1:
+                      stage = 'Within 1 hour before'
+                  elif hours_before <= 6:
+                      stage = '1 to 6 hours before'
+                  elif local.date() == webinar_start.date():
+                      stage = 'Same day, 6h+ before'
+                  elif (webinar_start.date() - local.date()).days == 1:
+                      stage = 'Day before'
+                  else:
+                      stage = '2+ days before'
+              final = bool(local and datetime.now(IST) - local >= timedelta(hours=18))
+              status = 'Final' if final else ('Still collecting' if local else 'Time unavailable')
+              issues = []
+              if delivered > sent:
+                  issues.append('Delivered count is higher than sent')
+              if read > delivered:
+                  issues.append('Read count is higher than delivered')
+              if count(rec['Failed']) > count(rec['Audience Size']):
+                  issues.append('Failed count is higher than audience')
+              if sent and delivered / sent < 0.8:
+                  issues.append('Low delivery rate')
+              if count(rec['Audience Size']) and count(rec['Failed']) / count(rec['Audience Size']) > 0.1:
+                  issues.append('High failure rate')
+              analysis_rows.append([
+                  rec['Campaign ID'], rec['Campaign Name'], count(rec['Audience Size']),
+                  sent, delivered, read, count(rec['Failed']), cost, rec['Last Updated'],
+                  stamp, local.strftime('%a') if local else '', local.hour if local else '',
+                  webinar_start.strftime('%Y-%m-%d %I:%M:%S %p IST') if webinar_start else '',
+                  webinar_start.strftime('%a %I:%M %p') if webinar_start else '',
+                  webinar_start.strftime('%Y-%m-%d') if webinar_start else '',
+                  hours_before, stage, message_type, angle,
+                  delivered / sent if sent else 0, read / delivered if delivered else 0,
+                  cost / read if read else '', status,
+                  'Yes' if final and sent >= 200 and message_type != 'Renewal offer' and not issues else 'No',
+                  '; '.join(issues),
+              ])
+          if analysis_ws.col_count < len(analysis_headers):
+              analysis_ws.add_cols(len(analysis_headers) - analysis_ws.col_count)
+          ensure_rows(analysis_ws, len(analysis_rows) + 1)
+          upsert_table(analysis_ws, analysis_headers, analysis_rows, 'Y')
+          spreadsheet.batch_update({'requests': [{'setDataValidation': {'range': {'sheetId': analysis_ws.id}, 'rule': None}}]})
+          analysis_ws.freeze(rows=1)
+          analysis_ws.format(f'C2:G{len(analysis_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
+          analysis_ws.format(f'T2:U{len(analysis_rows)+1}', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
+          for col in ('H', 'V'):
+              analysis_ws.format(f'{col}2:{col}{len(analysis_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0.00'}})
+          for col in ('I', 'J', 'M', 'O'):
+              analysis_ws.format(f'{col}2:{col}{len(analysis_rows)+1}', {'numberFormat': {'type': 'TEXT'}})
+          analysis_ws.format(f'L2:L{len(analysis_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '0'}})
+          analysis_ws.format(f'P2:P{len(analysis_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '0.00'}})
+
+          # Keep one webinar dashboard, reusing the former schedule tab if present.
+          schedule_ws = sheets_by_title.get('Broadcast Schedule')
+          if webinar_ws is None:
+              if schedule_ws is not None:
+                  schedule_ws.update_title('Webinar Dashboard')
+                  webinar_ws = schedule_ws
+                  schedule_ws = None
+              else:
+                  webinar_ws = spreadsheet.add_worksheet(title='Webinar Dashboard', rows=120, cols=20)
+
+          # Summary figures use current records; timing groups remain inferred.
+          groups = {}
+          for row in analysis_rows:
+              webinar = row[13] or 'Unassigned / renewals'
+              if webinar not in groups:
+                  groups[webinar] = [0, 0, 0, 0, 0, 0.0]
+              group = groups[webinar]
+              for index, value in enumerate((1, row[3], row[4], row[5], row[6], row[7])):
+                  group[index] += value
+          webinar_rows = [
+              ['Webinar Broadcast Dashboard'],
+              ['Last refreshed (IST)', ist_now()],
+              ['Webinar matching is inferred from send time and the configured weekly schedule.'],
+              ['Metric', 'Value'],
+              ['Broadcasts', len(records)],
+              ['Messages sent', total_sent],
+              ['Messages delivered', total_delivered],
+              ['Messages read', total_read],
+              ['Messages failed', total_failed],
+              ['Actual cost (INR)', total_cost],
+              ['Delivery rate', total_delivered / total_sent if total_sent else 0],
+              ['Read rate', total_read / total_delivered if total_delivered else 0],
+              ['Cost per read (INR)', total_cost / total_read if total_read else ''],
+              ['Broadcasts with date and time', sum(bool(rec.get('Broadcast Sent At (IST)')) for rec in records)],
+              [],
+              ['Performance by webinar (inferred)'],
+              ['Webinar', 'Broadcasts', 'Sent', 'Delivered', 'Read', 'Failed', 'Actual Cost (INR)', 'Delivery Rate', 'Read Rate', 'Cost per Read'],
+          ]
+          for label, values in sorted(groups.items()):
+              broadcasts, sent, delivered, read, failed, cost = values
+              webinar_rows.append([label, broadcasts, sent, delivered, read, failed, cost,
+                                   delivered / sent if sent else 0, read / delivered if delivered else 0,
+                                   cost / read if read else ''])
+          message_heading = len(webinar_rows) + 2
+          webinar_rows += [[], ['Performance by message type'],
+                           ['Message Type', 'Broadcasts', 'Sent', 'Delivered', 'Read', 'Read Rate', 'Actual Cost (INR)', 'Cost per Read']]
+          message_groups = {}
+          for row in analysis_rows:
+              label = row[17]
+              group = message_groups.setdefault(label, [0, 0, 0, 0, 0.0])
+              for index, value in enumerate((1, row[3], row[4], row[5], row[7])):
+                  group[index] += value
+          for label, values in sorted(message_groups.items()):
+              broadcasts, sent, delivered, read, cost = values
+              webinar_rows.append([label, broadcasts, sent, delivered, read,
+                                   read / delivered if delivered else 0, cost, cost / read if read else ''])
+          top_heading = len(webinar_rows) + 2
+          webinar_rows += [[], ['Latest broadcasts and metric updates'],
+                           ['Campaign Name', 'Date and Time (IST)', 'Sent', 'Delivered', 'Read', 'Read Rate', 'Actual Cost (INR)', 'Cost per Read']]
+          eligible = analysis_rows[:10]
+          for row in eligible:
+              webinar_rows.append([row[1], row[9], row[3], row[4], row[5], row[20], row[7], row[21]])
+          if not eligible:
+              webinar_rows.append(['No broadcast records available.'])
+          if webinar_ws.col_count < 20:
+              webinar_ws.add_cols(20 - webinar_ws.col_count)
+          ensure_rows(webinar_ws, max(100, len(webinar_rows)))
+          webinar_ws.clear()
+          update_values(webinar_ws, 'A1', webinar_rows)
+          spreadsheet.batch_update({'requests': [{'setDataValidation': {'range': {'sheetId': webinar_ws.id}, 'rule': None}}]})
+          webinar_ws.freeze(rows=1)
+          webinar_ws.format(f'A1:J{len(webinar_rows)}', {
+              'backgroundColor': {'red': 1, 'green': 1, 'blue': 1},
+              'textFormat': {'foregroundColor': {'red': 0.12, 'green': 0.16, 'blue': 0.2}, 'fontSize': 10},
+          })
+          webinar_ws.format('A1', {'textFormat': {'bold': True, 'fontSize': 18}})
+          for header_row in (4, 17, message_heading + 1, top_heading + 1):
+              webinar_ws.format(f'A{header_row}:J{header_row}', {
+                  'backgroundColor': {'red': 0.12, 'green': 0.3, 'blue': 0.27},
+                  'textFormat': {'bold': True, 'foregroundColor': {'red': 1, 'green': 1, 'blue': 1}},
+                  'wrapStrategy': 'WRAP',
+              })
+
+          webinar_ws.format('B11:B12', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
+          webinar_ws.format('B10', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0.00'}})
+          webinar_ws.format('B13', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0.00'}})
+          if groups:
+              webinar_ws.format(f'H18:I{17+len(groups)}', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
+              for col in ('G', 'J'):
+                  webinar_ws.format(f'{col}18:{col}{17+len(groups)}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0.00'}})
+          if message_groups:
+              start = message_heading + 2
+              webinar_ws.format(f'F{start}:F{start+len(message_groups)-1}', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
+          if eligible:
+              start = top_heading + 2
+              webinar_ws.format(f'F{start}:F{start+len(eligible)-1}', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
+
+          # Replace dashboard charts, preventing duplicate charts on every run.
+          chart_requests = []
+          metadata = sync_metadata
+          for sheet in metadata.get('sheets', []):
+              if sheet.get('properties', {}).get('sheetId') == webinar_ws.id:
+                  for chart in sheet.get('charts', []):
+                      chart_requests.append({'deleteEmbeddedObject': {'objectId': chart['chartId']}})
+          def chart_range(start_col, end_col):
+              return {'sheetId': webinar_ws.id, 'startRowIndex': 16,
+                      'endRowIndex': 17 + len(groups), 'startColumnIndex': start_col, 'endColumnIndex': end_col}
+          if groups:
+              for title, columns, row_anchor in (
+                  ('Messages delivered and read by webinar', ((3, 4), (4, 5)), 3),
+                  ('Read rate by webinar', ((8, 9),), 22),
+              ):
+                  chart_requests.append({'addChart': {'chart': {
+                      'spec': {'title': title, 'basicChart': {
+                          'chartType': 'COLUMN', 'legendPosition': 'BOTTOM_LEGEND', 'headerCount': 1,
+                          'axis': [{'position': 'BOTTOM_AXIS', 'title': 'Webinar (inferred)'},
+                                   {'position': 'LEFT_AXIS', 'title': 'Read rate' if len(columns) == 1 else 'Messages'}],
+                          'domains': [{'domain': {'sourceRange': {'sources': [chart_range(0, 1)]}}}],
+                          'series': [{'series': {'sourceRange': {'sources': [chart_range(a, b)]}}, 'targetAxis': 'LEFT_AXIS'} for a, b in columns],
+                      }},
+                      'position': {'overlayPosition': {'anchorCell': {'sheetId': webinar_ws.id, 'rowIndex': row_anchor, 'columnIndex': 11},
+                                                       'widthPixels': 650, 'heightPixels': 350}},
+                  }}})
+          chart_requests += [
+              {'updateDimensionProperties': {'range': {'sheetId': webinar_ws.id, 'dimension': 'COLUMNS', 'startIndex': 0, 'endIndex': 1}, 'properties': {'pixelSize': 310}, 'fields': 'pixelSize'}},
+              {'updateDimensionProperties': {'range': {'sheetId': webinar_ws.id, 'dimension': 'COLUMNS', 'startIndex': 1, 'endIndex': 10}, 'properties': {'pixelSize': 140}, 'fields': 'pixelSize'}},
+          ]
+          spreadsheet.batch_update({'requests': chart_requests})
+
+          if contents_ws is None:
+              contents_ws = spreadsheet.add_worksheet(title='Broadcast Contents', rows=max(100, len(records)+1), cols=8)
+          content_headers = ['Campaign ID', 'Campaign Name', 'Date and Time (IST)', 'Message Content',
+                             'Content Status', 'Content Source', 'Content Updated (IST)', 'Metrics Updated (IST)']
+          content_rows = []
+          fetched_by_id = {rec['Campaign ID']: rec for rec in fetched}
+          for rec in records:
+              cid = rec['Campaign ID']
+              previous = contents_by_id.get(cid, {})
+              fresh = fetched_by_id.get(cid, {})
+              text = fresh.get('Message Content') or previous.get('Message Content', '')
+              status = fresh.get('Content Status') if fresh.get('Message Content') else previous.get('Content Status', 'Content unavailable')
+              source = fresh.get('Content Source') if fresh.get('Message Content') else previous.get('Content Source', '')
+              content_time = fresh.get('Last Updated') if fresh.get('Message Content') else previous.get('Content Updated (IST)', '')
+              # Google Sheets cells are limited to 50,000 characters. Never truncate silently.
+              if len(str(text)) > 50000:
+                  raise RuntimeError(f'Content exceeds the Google Sheets cell limit for {cid}; previous content tab retained.')
+              content_rows.append([cid, rec['Campaign Name'], date_with_time(rec), text, status, source, content_time, rec['Last Updated']])
+          ensure_rows(contents_ws, len(content_rows)+1)
+          if contents_ws.col_count < 8:
+              contents_ws.add_cols(8 - contents_ws.col_count)
+          upsert_table(contents_ws, content_headers, content_rows, 'H')
+          contents_ws.freeze(rows=1)
+          contents_ws.format(f'D2:D{len(content_rows)+1}', {'wrapStrategy': 'WRAP', 'verticalAlignment': 'TOP'})
+          spreadsheet.batch_update({'requests': [
+              {'updateDimensionProperties': {'range': {'sheetId': contents_ws.id, 'dimension': 'COLUMNS', 'startIndex': 3, 'endIndex': 4}, 'properties': {'pixelSize': 650}, 'fields': 'pixelSize'}},
+              {'updateDimensionProperties': {'range': {'sheetId': contents_ws.id, 'dimension': 'COLUMNS', 'startIndex': 1, 'endIndex': 3}, 'properties': {'pixelSize': 260}, 'fields': 'pixelSize'}},
+              {'autoResizeDimensions': {'dimensions': {'sheetId': contents_ws.id, 'dimension': 'ROWS', 'startIndex': 1, 'endIndex': len(content_rows)+1}}},
+          ]})
+
+          # Persist rotation only after all report writes succeeded. Spreadsheet
+          # metadata stores the cursor without adding tabs or visible cells.
+          if next_history_cursor != history_cursor:
+              if cursor_entry:
+                  cursor_request = {'updateDeveloperMetadata': {
+                      'dataFilters': [{'developerMetadataLookup': {'metadataId': cursor_entry['metadataId']}}],
+                      'developerMetadata': {'metadataValue': next_history_cursor},
+                      'fields': 'metadataValue',
+                  }}
+              else:
+                  cursor_request = {'createDeveloperMetadata': {'developerMetadata': {
+                      'metadataKey': 'aisensy_history_cursor', 'metadataValue': next_history_cursor,
+                      'visibility': 'DOCUMENT', 'location': {'spreadsheet': True},
+                  }}}
+              spreadsheet.batch_update({'requests': [cursor_request]})
+
+          print(f'Sync complete: {new_count} new, {updated_count} updated, {len(records)} total campaigns.', flush=True)
           PY
-      - name: Upload calendar diagnostics if selection fails
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: flexifunnels-calendar-diagnostics-${{ github.run_id }}
-          path: diagnostics/*
-          if-no-files-found: ignore
-          retention-days: 3
-      - name: Upload verified CSV reports
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: flexifunnels-reports-${{ github.run_id }}
-          path: reports/*.csv
-          if-no-files-found: error
-          retention-days: 7
+
+      - name: Record failed sync in Dashboard
+        if: ${{ failure() }}
+        continue-on-error: true
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          GOOGLE_SHEET_ID: ${{ vars.GOOGLE_SHEET_ID }}
+        run: |
+          python - <<'PY'
+          import json, os
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          import gspread
+          from google.oauth2.service_account import Credentials
+
+          raw = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '').strip() or os.environ.get('GOOGLE_CREDENTIALS', '').strip()
+          if not raw:
+              raise RuntimeError('No Google credentials to report failed sync')
+
+          creds = Credentials.from_service_account_info(
+              json.loads(raw),
+              scopes=['https://www.googleapis.com/auth/spreadsheets']
+          )
+          sheet_id = os.environ.get('GOOGLE_SHEET_ID', '').strip() or '1jXnQPQngi-FbEBBHC0tvaOTXxmtE5_miv6Mq0rTbmLQ'
+          ws = gspread.authorize(creds).open_by_key(sheet_id).worksheet('Dashboard')
+          timestamp = datetime.now(ZoneInfo('Asia/Kolkata')).strftime('%Y-%m-%d %I:%M:%S %p IST')
+
+          # Do not overwrite Last Sync: it records the last successful sync.
+          ws.update(
+              range_name='C14',
+              values=[[f'FAILED check at {timestamp}; see GitHub Actions logs']],
+              value_input_option='RAW'
+          )
+          print('Recorded failure status in Dashboard; last successful sync timestamp retained.')
+          PY
