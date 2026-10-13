@@ -1,635 +1,783 @@
-name: Sync AiSensy Broadcasts to Google Sheets
+name: FlexiFunnels Discrepancy Tracker
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '23 */2 * * *'  # Every 2 hours, offset from GitHub's busy minute 0
 
 permissions:
   contents: read
 
-concurrency:
-  group: aisensy-google-sheets-sync
-  cancel-in-progress: false
-
 jobs:
-  sync:
+  test-google-sheets:
+    name: Test Google Sheets Connection
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 10
+
     steps:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install Google Sheets dependencies
         run: |
-          pip install playwright gspread google-auth
-          python -m playwright install --with-deps chromium
+          python -m pip install --upgrade pip
+          python -m pip install gspread google-auth
 
-      - name: Fetch up to 5 campaigns and update all sheets
+      - name: Verify Google Sheets access
         env:
-          AISENSY_SESSION: ${{ secrets.AISENSY_SESSION }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          GOOGLE_SHEET_ID: ${{ vars.GOOGLE_SHEET_ID }}
+          RAW_DATA_SHEET_ID: ${{ vars.RAW_DATA_SHEET_ID }}
+          UTM_SHEET_ID: ${{ vars.UTM_SHEET_ID }}
+          DISCREPANCY_SHEET_ID: ${{ vars.DISCREPANCY_SHEET_ID }}
+          UTM_LANDING_TAB: ${{ vars.UTM_LANDING_TAB }}
+          UTM_REG_TAB: ${{ vars.UTM_REG_TAB }}
+          DISCREPANCY_TAB_NAME: ${{ vars.DISCREPANCY_TAB_NAME }}
+
         run: |
-          python - <<'PY'
+          python -u - <<'PY'
           import json
           import os
-          import re
-          from contextlib import contextmanager
-          from datetime import timedelta
-          from datetime import datetime, timezone
-          from zoneinfo import ZoneInfo
-          from playwright.sync_api import sync_playwright
+
           import gspread
           from google.oauth2.service_account import Credentials
 
-          PROJECT_ID = '6589906ef69fc70b424e0e43'
-          LIST_URL = f'https://www.app.aisensy.com/projects/{PROJECT_ID}/campaigns/all'
-          MAX_CAMPAIGNS = 5
-          SHEET_ID = os.environ.get('GOOGLE_SHEET_ID', '').strip() or '1jXnQPQngi-FbEBBHC0tvaOTXxmtE5_miv6Mq0rTbmLQ'
-          IST = ZoneInfo('Asia/Kolkata')
+          print("=" * 60)
+          print("GOOGLE SHEETS CONNECTION TEST - VERSION 10")
+          print("=" * 60)
 
-          def ist_now():
-              return datetime.now(IST).strftime('%Y-%m-%d %I:%M:%S %p IST')
+          required = [
+              "GOOGLE_SERVICE_ACCOUNT_JSON",
+              "RAW_DATA_SHEET_ID",
+              "UTM_SHEET_ID",
+              "DISCREPANCY_SHEET_ID",
+              "UTM_LANDING_TAB",
+              "UTM_REG_TAB",
+              "DISCREPANCY_TAB_NAME",
+          ]
 
-          def existing_time_to_ist(value):
-              value = str(value or '').strip()
-              if not value:
-                  return value
-              if value.endswith(' IST'):
-                  return value
-              try:
-                  parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
-                  if parsed.tzinfo is None:
-                      parsed = parsed.replace(tzinfo=timezone.utc)
-                  return parsed.astimezone(IST).strftime('%Y-%m-%d %I:%M:%S %p IST')
-              except ValueError:
-                  return value
+          missing = [
+              name for name in required
+              if not os.environ.get(name, "").strip()
+          ]
 
-          HEADERS = ['Campaign ID', 'Campaign Name', 'Date', 'Campaign Type', 'Audience Size', 'Sent', 'Delivered', 'Read', 'Failed', 'Delivery Rate', 'Read Rate', 'Cost per Message', 'Estimated Cost', 'Actual Cost', 'Last Updated']
+          if missing:
+              raise RuntimeError(
+                  "Missing configuration: " + ", ".join(missing)
+              )
 
-          def number(value, default=0.0):
-              try:
-                  return float(re.sub(r'[^0-9.\-]', '', str(value)))
-              except (TypeError, ValueError):
-                  return default
-
-          def count(value):
-              return int(number(value))
-
-          def metric(body, label):
-              match = re.search(rf'(?im)^\s*{re.escape(label)}\s*\n\s*([\d,]+)\s*$', body)
-              return count(match.group(1)) if match else None
-
-          def money(body):
-              match = re.search(r'(?im)^\s*Total Credit Usage\s*\n\s*₹\s*([\d,]+(?:\.\d+)?)', body)
-              return number(match.group(1)) if match else None
-
-          def failed_count(body):
-              direct = metric(body, 'Failed')
-              if direct is not None:
-                  return direct
-              match = re.search(r'(?i)[\d.]+\s*%\s*\(\s*([\d,]+)\s*\)\s*Failed\b', body)
-              if match:
-                  return count(match.group(1))
-              return None
-
-          def date_from_body(body):
-              match = re.search(r'(?i)Created At\s*\n\s*([A-Za-z]{3}\s+\d{1,2},\s+\d{4})', body)
-              if not match:
-                  return ''
-              try:
-                  return datetime.strptime(match.group(1), '%b %d, %Y').strftime('%Y-%m-%d')
-              except ValueError:
-                  return ''
-
-          def sent_time_from_body(body):
-              # Only explicit actual-sent labels qualify. Never use creation,
-              # scheduled, updated, completion, or first-observed timestamps.
-              label = re.compile(r'^(?:Broadcast Sent At|Campaign Sent At|Sent At|Sent On)\s*(?::\s*(.*))?$', re.I)
-              lines = [line.strip() for line in body.splitlines() if line.strip()]
-              for index, line in enumerate(lines):
-                  match = label.fullmatch(line)
-                  if not match:
-                      continue
-                  value = (match.group(1) or '').strip()
-                  if not value and index + 1 < len(lines):
-                      value = lines[index + 1]
-                  # Require a clock time and an explicit timezone. A timezone-free
-                  # UI value cannot safely be assumed to be IST or UTC.
-                  if not re.search(r'\d{1,2}:\d{2}', value):
-                      continue
-                  tz_match = re.search(r'\s*(IST|UTC|GMT|Z|[+-]\d{2}:?\d{2})$', value, re.I)
-                  if not tz_match:
-                      continue
-                  zone = tz_match.group(1).upper()
-                  stamp = value[:tz_match.start()].strip().rstrip(',').strip()
-                  if zone == 'IST':
-                      tz = IST
-                  elif zone in ('UTC', 'GMT', 'Z'):
-                      tz = timezone.utc
-                  else:
-                      try:
-                          offset = zone if ':' in zone else zone[:3] + ':' + zone[3:]
-                          tz = datetime.fromisoformat('2000-01-01T00:00:00' + offset).tzinfo
-                      except ValueError:
-                          continue
-                  parsed = None
-                  try:
-                      parsed = datetime.fromisoformat(stamp)
-                  except ValueError:
-                      for fmt in (
-                          '%b %d, %Y %I:%M:%S %p', '%b %d, %Y %I:%M %p',
-                          '%B %d, %Y %I:%M:%S %p', '%B %d, %Y %I:%M %p',
-                          '%b %d, %Y, %I:%M:%S %p', '%b %d, %Y, %I:%M %p',
-                          '%b %d, %Y %H:%M:%S', '%b %d, %Y %H:%M',
-                          '%Y-%m-%d %I:%M:%S %p', '%Y-%m-%d %I:%M %p',
-                      ):
-                          try:
-                              parsed = datetime.strptime(stamp, fmt)
-                              break
-                          except ValueError:
-                              pass
-                  if parsed is not None:
-                      return parsed.replace(tzinfo=tz).astimezone(IST).strftime('%Y-%m-%d %I:%M:%S %p IST')
-              return ''
-
-          def actual_sent_value(value):
-              # Numeric API timestamps are Unix seconds or milliseconds.
-              if isinstance(value, bool) or value is None:
-                  return ''
-              if isinstance(value, (int, float)) or re.fullmatch(r'\d{10}(?:\.\d+)?|\d{13}', str(value).strip()):
-                  try:
-                      seconds = float(value)
-                      if seconds >= 1e12:
-                          seconds /= 1000
-                      parsed = datetime.fromtimestamp(seconds, timezone.utc)
-                      if 2000 <= parsed.year <= 2100:
-                          return parsed.astimezone(IST).strftime('%Y-%m-%d %I:%M:%S %p IST')
-                  except (ValueError, OverflowError, OSError):
-                      pass
-                  return ''
-              return sent_time_from_body('Sent At: ' + str(value))
-
-          @contextmanager
-          def campaign_responses(page):
-              payloads = []
-              def capture(response):
-                  # Read existing browser responses; no guessed API calls.
-                  if len(payloads) >= 100:
-                      return
-                  if not re.match(r'https://(?:[A-Za-z0-9-]+\.)*aisensy\.com/', response.url, re.I):
-                      return
-                  if not re.search(r'campaign|broadcast', response.url, re.I):
-                      return
-                  if response.request.resource_type not in ('xhr', 'fetch'):
-                      return
-                  try:
-                      if response.ok and 'json' in response.headers.get('content-type', '').lower():
-                          payload = response.json()
-                          if isinstance(payload, (dict, list)):
-                              payloads.append(payload)
-                  except Exception:
-                      pass  # Optional timestamp lookup cannot break metrics.
-              page.on('response', capture)
-              try:
-                  yield payloads
-              finally:
-                  page.remove_listener('response', capture)
-
-          def sent_time_from_responses(payloads, campaign_id):
-              allowed = {
-                  'sentat', 'senton', 'senttime', 'senttimestamp', 'sentdatetime',
-                  'broadcastsentat', 'broadcastsenttime', 'campaignsentat',
-                  'actualsentat', 'actualsenttime', 'actualsenttimestamp',
-              }
-              id_keys = {'id', 'campaignid', 'broadcastid'}
-              found = set()
-              observed_keys = set()
-              def normalized(key):
-                  return re.sub(r'[^a-z0-9]', '', str(key).lower())
-              def walk(value):
-                  if isinstance(value, list):
-                      for item in value:
-                          walk(item)
-                  elif isinstance(value, dict):
-                      ids = [str(v) for k, v in value.items() if normalized(k) in id_keys and not isinstance(v, (dict, list))]
-                      # Require a matching campaign object, never a recipient/message.
-                      if campaign_id in ids and not any(normalized(k) in {'messageid', 'contactid', 'recipientid', 'phone', 'phonenumber'} for k in value):
-                          observed_keys.update(str(k) for k in value if re.search(r'at$|time|date|sent', str(k), re.I))
-                          for key, item in value.items():
-                              if normalized(key) in allowed:
-                                  timestamp = actual_sent_value(item)
-                                  if timestamp:
-                                      found.add(timestamp)
-                      for item in value.values():
-                          if isinstance(item, (dict, list)):
-                              walk(item)
-              for payload in payloads:
-                  walk(payload)
-              if len(found) == 1:
-                  return next(iter(found))
-              if len(found) > 1:
-                  print(f'Conflicting explicit sent timestamps for {campaign_id}; retaining historical value.', flush=True)
-              elif observed_keys:
-                  print(f'No usable actual-sent field for {campaign_id}; timestamp field names: {sorted(observed_keys)}', flush=True)
-              return ''
-
-          def resolve_sent_time(body, payloads, campaign_id):
-              return sent_time_from_responses(payloads, campaign_id) or sent_time_from_body(body)
-
-          def source_time(value):
-              # Preserve the existing Broadcast Analysis values as requested.
-              # These values are not evidence of actual sending by themselves.
-              if isinstance(value, (int, float)) and not isinstance(value, bool):
-                  if 36526 <= value < 73416:
-                      local = datetime(1899, 12, 30) + timedelta(seconds=round(value * 86400))
-                      return local.strftime('%Y-%m-%d %I:%M:%S %p IST')
-                  return ''
-              return actual_sent_value(value)
-
-          def read_analysis_times(ws):
-              rows = ws.get_all_values(value_render_option='UNFORMATTED_VALUE')
-              if not rows:
-                  return {}
-              header = [str(v).strip() for v in rows[0]]
-              if 'Campaign ID' not in header or 'Sent At (IST)' not in header:
-                  raise RuntimeError('Broadcast Analysis lacks Campaign ID or Sent At (IST); cleanup was not performed.')
-              id_col, time_col = header.index('Campaign ID'), header.index('Sent At (IST)')
-              result = {}
-              for row in rows[1:]:
-                  if len(row) <= max(id_col, time_col):
-                      continue
-                  cid = str(row[id_col]).strip()
-                  value = source_time(row[time_col])
-                  if cid and value:
-                      if cid in result and result[cid] != value:
-                          raise RuntimeError(f'Conflicting source times for {cid}; cleanup was not performed.')
-                      result[cid] = value
-              return result
-
-          def date_with_time(rec):
-              return rec.get('Broadcast Sent At (IST)') or rec.get('Date', '')
-
-          def extract_names(body):
-              lines = [line.strip() for line in body.splitlines() if line.strip()]
-              names = []
-              for index, line in enumerate(lines):
-                  if line.upper() != 'BROADCAST' or index == 0:
-                      continue
-                  candidate = lines[index - 1]
-                  if candidate.lower() in ('campaign', 'type', 'broadcast', 'status', 'audience'):
-                      continue
-                  nearby = ' '.join(lines[index + 1:index + 5])
-                  if not re.search(r'[A-Za-z]{3}\s+\d{1,2},\s+\d{4}', nearby):
-                      continue
-                  if candidate not in names:
-                      names.append(candidate)
-                  if len(names) >= MAX_CAMPAIGNS:
-                      break
-              return names
-
-          def wait_for_list(page):
-              page.goto(LIST_URL, wait_until='domcontentloaded', timeout=60000)
-              page.get_by_text('Rows per page:', exact=False).first.wait_for(timeout=30000)
-              page.wait_for_timeout(1400)
-
-          def discover_names(page):
-              best = []
-              for attempt in range(1, 4):
-                  wait_for_list(page)
-                  current = extract_names(page.locator('body').inner_text())
-                  print(f'Campaign discovery attempt {attempt}: found {len(current)}', flush=True)
-                  if len(current) > len(best):
-                      best = current
-                  if len(best) >= MAX_CAMPAIGNS:
-                      break
-                  page.wait_for_timeout(1700 * attempt)
-              if not best:
-                  print('No campaigns detected; no spreadsheet changes will be made.', flush=True)
-              elif len(best) < MAX_CAMPAIGNS:
-                  print(f'Continuing with {len(best)} available campaign(s), not requiring five.', flush=True)
-              return best[:MAX_CAMPAIGNS]
-
-          def fetch_campaign(page, name):
-              with campaign_responses(page) as payloads:
-                  wait_for_list(page)
-                  target = page.get_by_text(name, exact=True).first
-                  target.wait_for(timeout=20000)
-                  target.click(timeout=20000)
-                  page.wait_for_url(re.compile(r'/campaigns/all/view/[A-Za-z0-9]+'), timeout=30000)
-                  page.get_by_text('Total Credit Usage', exact=True).first.wait_for(timeout=30000)
-                  page.wait_for_timeout(500)
-                  campaign_id = re.search(r'/view/([A-Za-z0-9]+)', page.url).group(1)
-                  body = page.locator('body').inner_text()
-                  values = {
-                      'Audience Size': metric(body, 'Audience'),
-                      'Sent': metric(body, 'Sent'),
-                      'Delivered': metric(body, 'Delivered'),
-                      'Read': metric(body, 'Read'),
-                      'Failed': failed_count(body),
-                      'Actual Cost': money(body),
-                  }
-                  missing = [key for key, value in values.items() if value is None]
-                  if missing:
-                      raise RuntimeError(f'Missing metrics for {name}: {missing}')
-                  kind = re.search(r'(?im)^\s*Campaign Type\s*\n\s*([A-Z_]+)', body)
-                  record = {
-                      'Campaign ID': campaign_id,
-                      'Campaign Name': name,
-                      'Date': date_from_body(body),
-                      'Broadcast Sent At (IST)': resolve_sent_time(body, payloads, campaign_id),
-                      'Campaign Type': kind.group(1) if kind else 'BROADCAST',
-                      **values,
-                      'Cost per Message': (values['Actual Cost'] / values['Sent']) if values['Sent'] else 0.0,
-                      'Estimated Cost': '',
-                      'Last Updated': ist_now(),
-                  }
-                  if not record['Broadcast Sent At (IST)']:
-                      print(f'No usable explicit sent timestamp for {name}; retaining any historical value.', flush=True)
-                  print(f"Fetched {name}: sent={record['Sent']}, delivered={record['Delivered']}, cost=INR {record['Actual Cost']}", flush=True)
-                  return record
-
-          def existing_record(row):
-              padded = list(row[:15]) + [''] * max(0, 15 - len(row))
-              rec = dict(zip(HEADERS, padded))
-              for field in ('Audience Size', 'Sent', 'Delivered', 'Read', 'Failed'):
-                  rec[field] = count(rec[field])
-              for field in ('Cost per Message', 'Estimated Cost', 'Actual Cost'):
-                  rec[field] = number(rec[field])
-              rec['Last Updated'] = existing_time_to_ist(rec.get('Last Updated', ''))
-              rec['Campaign ID'] = str(rec['Campaign ID']).strip()
-              # Migrate a timestamp column from earlier versions before clearing it.
-              rec['Broadcast Sent At (IST)'] = str(row[15]).strip() if len(row) > 15 else ''
-              if not rec['Broadcast Sent At (IST)'] and ':' in str(rec['Date']):
-                  rec['Broadcast Sent At (IST)'] = str(rec['Date'])
-              return rec
-
-          def output_row(rec):
-              sent, delivered, read = count(rec['Sent']), count(rec['Delivered']), count(rec['Read'])
-              rate = number(rec['Actual Cost']) / sent if sent else 0.0
-              return [
-                  rec['Campaign ID'], rec['Campaign Name'], date_with_time(rec), rec['Campaign Type'],
-                  count(rec['Audience Size']), sent, delivered, read, count(rec['Failed']),
-                  delivered / sent if sent else 0, read / delivered if delivered else 0,
-                  rate, '', number(rec['Actual Cost']), rec['Last Updated'],
-              ]
-
-          def ensure_rows(ws, minimum):
-              if ws.row_count < minimum:
-                  ws.add_rows(minimum - ws.row_count)
-
-          def update_values(ws, range_name, rows):
-              ws.update(range_name=range_name, values=rows, value_input_option='RAW')
-
-          session_json = os.environ.get('AISENSY_SESSION', '').strip()
-          google_json = (os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '').strip()
-                         or os.environ.get('GOOGLE_CREDENTIALS', '').strip())
-          if not session_json:
-              raise RuntimeError('Missing AISENSY_SESSION secret')
-          if not google_json:
-              raise RuntimeError('Missing GOOGLE_SERVICE_ACCOUNT_JSON secret')
-          session = json.loads(session_json)
           credentials = Credentials.from_service_account_info(
-              json.loads(google_json), scopes=['https://www.googleapis.com/auth/spreadsheets'])
-          spreadsheet = gspread.authorize(credentials).open_by_key(SHEET_ID)
-          data_ws = spreadsheet.worksheet('Broadcast_Data')
-          summary_ws = spreadsheet.worksheet('Cost Summary')
-          dashboard_ws = spreadsheet.worksheet('Dashboard')
-
-          sheets_by_title = {ws.title: ws for ws in spreadsheet.worksheets()}
-          analysis_ws = sheets_by_title.get('Broadcast Analysis')
-          source_times = read_analysis_times(analysis_ws) if analysis_ws else {}
-          webinar_ws = sheets_by_title.get('Webinar Dashboard')
-          # Snapshot only when removing dependencies. Keep existing cells/layout.
-          webinar_snapshot = webinar_ws.get_all_values() if webinar_ws and any(title in sheets_by_title for title in ('Broadcast Analysis', 'Message Tests', 'Dashboard Settings')) else None
-
-          existing_rows = data_ws.get_all_values()
-          existing_by_id = {}
-          order = []
-          for row in existing_rows[1:]:
-              if not row or not row[0].strip():
-                  continue
-              rec = existing_record(row)
-              cid = rec['Campaign ID']
-              if not rec['Broadcast Sent At (IST)']:
-                  rec['Broadcast Sent At (IST)'] = source_times.get(cid, '')
-              if cid not in existing_by_id:
-                  order.append(cid)
-              existing_by_id[cid] = rec
-          print(f'Historical campaigns retained: {len(order)}', flush=True)
-
-          fetched = []
-          with sync_playwright() as playwright:
-              browser = playwright.chromium.launch(headless=True)
-              context = browser.new_context(storage_state=session)
-              page = context.new_page()
-              names = discover_names(page)
-              for name in names:
-                  try:
-                      fetched.append(fetch_campaign(page, name))
-                  except Exception as exc:
-                      print(f'WARNING: Skipped {name}: {exc}', flush=True)
-              browser.close()
-
-          if not names:
-              raise RuntimeError('AiSensy campaign list returned no names. Session may have expired or the page changed; spreadsheet was not modified.')
-          if not fetched:
-              raise RuntimeError('AiSensy campaigns were listed but none could be fetched. Spreadsheet was not modified.')
-          sync_time = ist_now()
-          new_ids = {rec['Campaign ID'] for rec in fetched if rec['Campaign ID'] not in existing_by_id}
-
-          # Refresh every successfully fetched campaign on every run.
-          # Retain historical campaigns that were not fetched this time.
-          if new_ids:
-              print(f'{len(new_ids)} new broadcast(s) found; refreshing fetched campaign metrics.', flush=True)
-          else:
-              print('No new broadcasts; refreshing fetched campaign metrics.', flush=True)
-
-          new_count = 0
-          updated_count = 0
-          for rec in fetched:
-              cid = rec['Campaign ID']
-              if not rec.get('Broadcast Sent At (IST)'):
-                  rec['Broadcast Sent At (IST)'] = source_times.get(cid, '')
-              if cid in existing_by_id:
-                  old = existing_by_id[cid]
-                  if not rec['Date']:
-                      rec['Date'] = old.get('Date', '')
-                  if not rec.get('Broadcast Sent At (IST)'):
-                      rec['Broadcast Sent At (IST)'] = old.get('Broadcast Sent At (IST)', '')
-                  updated_count += 1
-              else:
-                  order.append(cid)
-                  new_count += 1
-              existing_by_id[cid] = rec
-
-          # Date descending, with fetched campaigns first within the same date.
-          # Preserve existing relative order for other same-day campaigns.
-          fetched_rank = {rec['Campaign ID']: idx for idx, rec in enumerate(fetched)}
-          original_rank = {cid: idx for idx, cid in enumerate(order)}
-          records = sorted(
-              (existing_by_id[cid] for cid in order),
-              key=lambda rec: (
-                  str(date_with_time(rec))[:10],
-                  1 if rec['Campaign ID'] in fetched_rank else 0,
-                  -fetched_rank.get(rec['Campaign ID'], original_rank[rec['Campaign ID']]),
-              ),
-              reverse=True,
+              json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]),
+              scopes=[
+                  "https://www.googleapis.com/auth/spreadsheets.readonly"
+              ],
           )
-          missing_source_ids = set(source_times) - set(existing_by_id)
-          if missing_source_ids:
-              raise RuntimeError('Source times include campaigns missing from Broadcast_Data; no cleanup was performed.')
-          data_rows = [output_row(rec) for rec in records]
-          ensure_rows(data_ws, len(data_rows) + 1)
-          update_values(data_ws, 'A1:O1', [HEADERS])
-          update_values(data_ws, f'A2:O{len(data_rows)+1}', data_rows)
-          if len(existing_rows) > len(data_rows) + 1:
-              data_ws.batch_clear([f'A{len(data_rows)+2}:O{len(existing_rows)}'])
-          data_ws.format(f'C2:C{len(data_rows)+1}', {'numberFormat': {'type': 'TEXT'}})
-          data_ws.format(f'O2:O{len(data_rows)+1}', {'numberFormat': {'type': 'TEXT'}})
-          data_ws.format(f'E2:I{len(data_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
-          data_ws.format(f'J2:K{len(data_rows)+1}', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
-          data_ws.format(f'L2:L{len(data_rows)+1}', {'numberFormat': {'type': 'CURRENCY', 'pattern': '₹#,##0.000'}})
-          data_ws.format(f'N2:N{len(data_rows)+1}', {'numberFormat': {'type': 'CURRENCY', 'pattern': '₹#,##0.00'}})
 
-          summary_header = [
-              'Campaign ID', 'Campaign Name', 'Date', 'Audience', 'Sent', 'Delivered',
-              'Read', 'Failed', 'Actual Cost (INR)', 'Cost per Sent',
-              'Cost per Delivered', 'Last Updated',
+          client = gspread.authorize(credentials)
+
+          spreadsheet_ids = {
+              "RAW DATA": os.environ["RAW_DATA_SHEET_ID"],
+              "UTM": os.environ["UTM_SHEET_ID"],
+              "DISCREPANCY STATS": os.environ["DISCREPANCY_SHEET_ID"],
+          }
+
+          opened = {}
+
+          for label, spreadsheet_id in spreadsheet_ids.items():
+              spreadsheet = client.open_by_key(spreadsheet_id)
+              opened[label] = spreadsheet
+
+              print("\n" + label + ": CONNECTED")
+              print("Spreadsheet:", spreadsheet.title)
+              print("Total tabs:", len(spreadsheet.worksheets()))
+
+          print("\nCHECKING CONFIGURED SOURCE TABS")
+
+          checks = [
+              ("UTM_LANDING_TAB", "UTM"),
+              ("UTM_REG_TAB", "UTM"),
+              ("DISCREPANCY_TAB_NAME", "DISCREPANCY STATS"),
           ]
-          summary_rows = []
-          for rec in records:
-              sent = count(rec['Sent'])
-              delivered = count(rec['Delivered'])
-              cost = number(rec['Actual Cost'])
-              summary_rows.append([
-                  rec['Campaign ID'], rec['Campaign Name'], date_with_time(rec),
-                  count(rec['Audience Size']), sent, delivered, count(rec['Read']),
-                  count(rec['Failed']), cost, cost / sent if sent else 0,
-                  cost / delivered if delivered else 0, rec['Last Updated'],
-              ])
-          previous_summary = len(summary_ws.get_all_values())
-          ensure_rows(summary_ws, len(summary_rows) + 1)
-          update_values(summary_ws, f'A1:L{len(summary_rows)+1}', [summary_header] + summary_rows)
-          if previous_summary > len(summary_rows) + 1:
-              summary_ws.batch_clear([f'A{len(summary_rows)+2}:L{previous_summary}'])
-          summary_ws.format(f'C2:C{len(summary_rows)+1}', {'numberFormat': {'type': 'TEXT'}})
-          summary_ws.format(f'L2:L{len(summary_rows)+1}', {'numberFormat': {'type': 'TEXT'}})
-          summary_ws.format(f'D2:H{len(summary_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
-          summary_ws.format(f'I2:K{len(summary_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0.000'}})
 
-          total_sent = sum(count(rec['Sent']) for rec in records)
-          total_delivered = sum(count(rec['Delivered']) for rec in records)
-          total_read = sum(count(rec['Read']) for rec in records)
-          total_failed = sum(count(rec['Failed']) for rec in records)
-          total_cost = sum(number(rec['Actual Cost']) for rec in records)
-          dashboard = [
-              ['Metric', 'Total'],
-              ['Total Broadcasts', len(records)],
-              ['Total Audience', sum(count(rec['Audience Size']) for rec in records)],
-              ['Total Messages Sent', total_sent],
-              ['Total Messages Delivered', total_delivered],
-              ['Total Messages Read', total_read],
-              ['Total Messages Failed', total_failed],
-              ['Total Estimated Cost', 'Not available from AiSensy'],
-              ['Total Actual Cost', total_cost],
-              ['Overall Delivery Rate', total_delivered / total_sent if total_sent else 0],
-              ['Overall Read Rate', total_read / total_delivered if total_delivered else 0],
-              ['Average Cost per Sent Message', total_cost / total_sent if total_sent else 0],
-              ['Last Sync (IST)', sync_time],
-              ['Campaigns Added This Sync', new_count, f'{new_count} new campaign(s) added; {updated_count} existing campaign(s) refreshed'],
-              ['CAMPAIGN PERFORMANCE'],
-              ['Campaign Name', 'Date', 'Sent', 'Delivered', 'Read', 'Failed', 'Delivery Rate', 'Read Rate', 'Actual Cost (INR)'],
-          ]
-          for rec in records:
-              sent, delivered, read = count(rec['Sent']), count(rec['Delivered']), count(rec['Read'])
-              dashboard.append([
-                  rec['Campaign Name'], date_with_time(rec), sent, delivered, read, count(rec['Failed']),
-                  delivered / sent if sent else 0, read / delivered if delivered else 0,
-                  number(rec['Actual Cost']),
-              ])
-          previous_dashboard = len(dashboard_ws.get_all_values())
-          ensure_rows(dashboard_ws, len(dashboard))
-          dashboard_ws.batch_clear([f'A1:O{max(previous_dashboard, len(dashboard))}'])
-          dashboard[12][1] = ist_now()  # Actual dashboard write time in IST
-          update_values(dashboard_ws, f'A1:I{len(dashboard)}', dashboard)
-          dashboard_ws.format('B13', {'numberFormat': {'type': 'TEXT'}})
-          dashboard_ws.format('B2:B7', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
-          dashboard_ws.format('B10:B11', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
-          dashboard_ws.format('B8:B9', {'numberFormat': {'type': 'CURRENCY', 'pattern': '₹#,##0.00'}})
-          if records:
-              dashboard_ws.format(f'B17:B{16+len(records)}', {'numberFormat': {'type': 'TEXT'}})
-              dashboard_ws.format(f'C17:F{16+len(records)}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
-              dashboard_ws.format(f'G17:H{16+len(records)}', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
-              dashboard_ws.format(f'I17:I{16+len(records)}', {'numberFormat': {'type': 'CURRENCY', 'pattern': '₹#,##0.00'}})
+          for variable, spreadsheet_label in checks:
+              tab_name = os.environ[variable].strip()
 
-          # Clear only the timestamp columns added by earlier replacements.
-          # Do not delete columns, which could shift unrelated references.
-          for ws, col, label in (
-              (data_ws, 'P', 'Broadcast Sent At (IST)'),
-              (summary_ws, 'M', 'Broadcast Sent At (IST)'),
-          ):
-              if ws.acell(f'{col}1').value == label:
-                  ws.batch_clear([f'{col}1:{col}{ws.row_count}'])
+              try:
+                  opened[spreadsheet_label].worksheet(tab_name)
+                  print(variable + ": FOUND")
+              except gspread.WorksheetNotFound:
+                  raise RuntimeError(
+                      variable + " does not match an existing tab."
+                  )
 
-          if webinar_snapshot:
-              # Replacing dependent formulas with their displayed values keeps
-              # the current webinar report readable after its sources are removed.
-              width = max(len(row) for row in webinar_snapshot)
-              webinar_ws.clear()
-              update_values(webinar_ws, 'A1', [row + [''] * (width - len(row)) for row in webinar_snapshot])
-              spreadsheet.batch_update({'requests': [{
-                  'setDataValidation': {
-                      'range': {'sheetId': webinar_ws.id},
-                      'rule': None,
-                  }
-              }]})
-
-          # Cleanup is last: source times and reports have already been saved.
-          for title in ('Broadcast Analysis', 'Message Tests', 'Dashboard Settings'):
-              ws = sheets_by_title.get(title)
-              if ws is not None:
-                  spreadsheet.del_worksheet(ws)
-
-          print(f'Sync complete: {new_count} new, {updated_count} updated, {len(records)} total campaigns.', flush=True)
+          print("\n" + "=" * 60)
+          print("GOOGLE SHEETS CONNECTION TEST SUCCESSFUL")
+          print("READ-ONLY TEST: NO DATA MODIFIED")
+          print("=" * 60)
           PY
 
-      - name: Record failed sync in Dashboard
-        if: ${{ failure() }}
-        continue-on-error: true
-        env:
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          GOOGLE_SHEET_ID: ${{ vars.GOOGLE_SHEET_ID }}
+  test-flexifunnels-login:
+    name: Test FlexiFunnels Login
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install Playwright
         run: |
-          python - <<'PY'
-          import json, os
-          from datetime import datetime
-          from zoneinfo import ZoneInfo
-          import gspread
-          from google.oauth2.service_account import Credentials
+          python -m pip install --upgrade pip
+          python -m pip install playwright
+          python -m playwright install --with-deps chromium
 
-          raw = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '').strip() or os.environ.get('GOOGLE_CREDENTIALS', '').strip()
-          if not raw:
-              raise RuntimeError('No Google credentials to report failed sync')
+      - name: Test login, sub-user switch, and project URL search
+        env:
+          FLEXIFUNNELS_EMAIL: ${{ secrets.FLEXIFUNNELS_EMAIL }}
+          FLEXIFUNNELS_PASSWORD: ${{ secrets.FLEXIFUNNELS_PASSWORD }}
+          FLEXIFUNNELS_PROJECT_URL: ${{ vars.FLEXIFUNNELS_PROJECT_URL }}
+          FLEXIFUNNELS_SUB_USER: Saurabh Bhatnagar
 
-          creds = Credentials.from_service_account_info(
-              json.loads(raw),
-              scopes=['https://www.googleapis.com/auth/spreadsheets']
+        run: |
+          python -u - <<'PY'
+          import os
+          import re
+          import time
+          from urllib.parse import urlparse
+
+          from playwright.sync_api import sync_playwright
+
+          print("=" * 60)
+          print("FLEXIFUNNELS LOGIN TEST - VERSION 10")
+          print("=" * 60)
+
+          email = os.environ.get(
+              "FLEXIFUNNELS_EMAIL", ""
+          ).strip()
+
+          password = os.environ.get(
+              "FLEXIFUNNELS_PASSWORD", ""
           )
-          sheet_id = os.environ.get('GOOGLE_SHEET_ID', '').strip() or '1jXnQPQngi-FbEBBHC0tvaOTXxmtE5_miv6Mq0rTbmLQ'
-          ws = gspread.authorize(creds).open_by_key(sheet_id).worksheet('Dashboard')
-          timestamp = datetime.now(ZoneInfo('Asia/Kolkata')).strftime('%Y-%m-%d %I:%M:%S %p IST')
 
-          # Do not overwrite Last Sync: it records the last successful sync.
-          ws.update(
-              range_name='C14',
-              values=[[f'FAILED check at {timestamp}; see GitHub Actions logs']],
-              value_input_option='RAW'
-          )
-          print('Recorded failure status in Dashboard; last successful sync timestamp retained.')
+          project_url = os.environ.get(
+              "FLEXIFUNNELS_PROJECT_URL", ""
+          ).strip()
+
+          sub_user = os.environ.get(
+              "FLEXIFUNNELS_SUB_USER", ""
+          ).strip()
+
+          if not email or not password:
+              raise RuntimeError(
+                  "FlexiFunnels credentials are missing."
+              )
+
+          if sub_user != "Saurabh Bhatnagar":
+              raise RuntimeError(
+                  "Unexpected sub-user configuration."
+              )
+
+          parsed_project = urlparse(project_url)
+
+          if (
+              parsed_project.scheme != "https"
+              or parsed_project.hostname != "app.flexifunnels.com"
+              or parsed_project.path.rstrip("/")
+                 != "/projects/kvapNzyj"
+          ):
+              raise RuntimeError(
+                  "Unexpected project URL configuration."
+              )
+
+          def safe_location(page):
+              if page.is_closed():
+                  return "closed"
+
+              parsed = urlparse(page.url)
+
+              return (
+                  parsed.scheme
+                  + "://"
+                  + (parsed.hostname or "")
+                  + parsed.path
+              )
+
+          def current_path(page):
+              if page.is_closed():
+                  return ""
+
+              return urlparse(page.url).path.rstrip("/")
+
+          def visible_items(locator, limit=50):
+              matches = []
+
+              for index in range(min(locator.count(), limit)):
+                  item = locator.nth(index)
+
+                  if item.is_visible():
+                      matches.append(item)
+
+              return matches
+
+          def unique_visible(locator):
+              matches = visible_items(locator)
+
+              if len(matches) == 1:
+                  return matches[0]
+
+              return None
+
+          def wait_for_path_change(page, original, seconds=25):
+              deadline = time.monotonic() + seconds
+
+              while time.monotonic() < deadline:
+                  path = current_path(page)
+
+                  if path != original:
+                      return path
+
+                  time.sleep(1)
+
+              return current_path(page)
+
+          def find_login_field(page, selectors):
+              for selector in selectors:
+                  try:
+                      locator = page.locator(selector)
+                      field = unique_visible(locator)
+
+                      if field is not None:
+                          return field
+                  except Exception:
+                      continue
+
+              return None
+
+          def select_saurabh(page):
+              print("\nSTEP 7: Finding Saurabh Bhatnagar")
+
+              exact_name = re.compile(
+                  r"^\s*Saurabh Bhatnagar\s*$",
+                  re.IGNORECASE,
+              )
+
+              name_element = unique_visible(
+                  page.get_by_text(exact_name)
+              )
+
+              if name_element is None:
+                  raise RuntimeError(
+                      "Saurabh Bhatnagar was not found uniquely."
+                  )
+
+              print("Saurabh Bhatnagar: FOUND")
+
+              print(
+                  "\nSTEP 8: Finding Switch to user "
+                  "inside Saurabh's card"
+              )
+
+              # Keep the selector that worked in Version 9.
+              # The account switch control is an anchor.
+
+              card = name_element.locator(
+                  "xpath=ancestor::*["
+                  ".//*["
+                  "self::a or self::button or @role='button'"
+                  "]["
+                  "contains("
+                  "translate(normalize-space(.), "
+                  "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
+                  "'abcdefghijklmnopqrstuvwxyz'), "
+                  "'switch to user'"
+                  ")"
+                  "]"
+                  "][1]"
+              )
+
+              if card.count() != 1 or not card.is_visible():
+                  raise RuntimeError(
+                      "Could not identify Saurabh's account card."
+                  )
+
+              print("Saurabh account card: FOUND")
+
+              switch_pattern = re.compile(
+                  r"^\s*Switch to user\s*$",
+                  re.IGNORECASE,
+              )
+
+              controls = card.locator(
+                  "a, button, [role='button']"
+              )
+
+              matches = []
+
+              for control in visible_items(controls):
+                  label = control.inner_text().strip()
+
+                  if switch_pattern.fullmatch(label):
+                      matches.append(control)
+
+              if len(matches) != 1:
+                  raise RuntimeError(
+                      "Could not uniquely identify "
+                      "Saurabh's Switch to user control."
+                  )
+
+              switch_control = matches[0]
+
+              if not switch_control.is_enabled():
+                  raise RuntimeError(
+                      "Saurabh's Switch to user control is disabled."
+                  )
+
+              tag = switch_control.evaluate(
+                  "(element) => element.tagName.toLowerCase()"
+              )
+
+              print("Correct Switch to user control found.")
+              print("Control type:", tag)
+
+              # Read only the destination structure.
+              # Do not log hrefs or account IDs.
+
+              target = switch_control.get_attribute("target")
+
+              print(
+                  "Opens new tab:",
+                  target == "_blank",
+              )
+
+              print("\nSTEP 9: Switching to Saurabh")
+
+              switch_control.click(timeout=15000)
+
+              print(
+                  "Clicked Switch to user "
+                  "inside Saurabh's card."
+              )
+
+          def locate_switched_page(context, original_page):
+              print(
+                  "\nSTEP 10: Checking browser tabs "
+                  "after sub-user switch"
+              )
+
+              deadline = time.monotonic() + 30
+
+              while time.monotonic() < deadline:
+                  pages = [
+                      p for p in context.pages
+                      if not p.is_closed()
+                  ]
+
+                  for candidate in reversed(pages):
+                      if candidate != original_page:
+                          candidate.wait_for_load_state(
+                              "domcontentloaded",
+                              timeout=15000,
+                          )
+
+                          print(
+                              "Additional browser tab detected."
+                          )
+                          print(
+                              "New tab location:",
+                              safe_location(candidate),
+                          )
+
+                          parsed = urlparse(candidate.url)
+
+                          if (
+                              parsed.scheme != "https"
+                              or parsed.hostname != "app.flexifunnels.com"
+                          ):
+                              raise RuntimeError(
+                                  "Unexpected destination "
+                                  "after sub-user switch."
+                              )
+
+                          return candidate
+
+                  if current_path(original_page) != "/switch-sub-users":
+                      print(
+                          "Original tab changed location."
+                      )
+                      print(
+                          "Location:",
+                          safe_location(original_page),
+                      )
+
+                      return original_page
+
+                  time.sleep(1)
+
+              print(
+                  "No navigation or new tab detected "
+                  "after clicking Switch to user."
+              )
+
+              return original_page
+
+          def open_projects(page):
+              print(
+                  "\nSTEP 11: Opening Projects "
+                  "after sub-user selection"
+              )
+
+              page.goto(
+                  "https://app.flexifunnels.com/projects",
+                  wait_until="domcontentloaded",
+                  timeout=60000,
+              )
+
+              page.wait_for_timeout(4000)
+
+              print(
+                  "Projects page location:",
+                  safe_location(page),
+              )
+
+              if current_path(page) != "/projects":
+                  raise RuntimeError(
+                      "Projects page is inaccessible "
+                      "after switching sub-users."
+                  )
+
+              # Verify the page is actually displaying
+              # project search controls, not merely
+              # the expected URL.
+
+              search_field = unique_visible(
+                  page.locator(
+                      'input[placeholder*="Search" i]'
+                  )
+              )
+
+              if search_field is None:
+                  raise RuntimeError(
+                      "Projects page opened, but the "
+                      "project search field is missing."
+                  )
+
+              print(
+                  "SUCCESS: PROJECTS PAGE ACCESS VERIFIED"
+              )
+
+          def choose_project_url_filter(page):
+              print(
+                  "\nSTEP 12: Selecting Project URL filter"
+              )
+
+              dropdown = unique_visible(
+                  page.get_by_text(
+                      "Project Name",
+                      exact=True,
+                  )
+              )
+
+              if dropdown is None:
+                  # The dropdown may already be set
+                  # to Project URL.
+
+                  selected = unique_visible(
+                      page.get_by_text(
+                          "Project URL",
+                          exact=True,
+                      )
+                  )
+
+                  if selected is not None:
+                      print(
+                          "Project URL filter already selected."
+                      )
+                      return
+
+                  raise RuntimeError(
+                      "Project search filter was not found."
+                  )
+
+              dropdown.click(timeout=15000)
+
+              page.wait_for_timeout(1000)
+
+              option = unique_visible(
+                  page.get_by_text(
+                      "Project URL",
+                      exact=True,
+                  )
+              )
+
+              if option is None:
+                  raise RuntimeError(
+                      "Project URL option not found."
+                  )
+
+              option.click(timeout=15000)
+
+              print("Project URL filter selected.")
+
+          def search_project(page):
+              print("\nSTEP 13: Entering project URL")
+
+              search_field = unique_visible(
+                  page.locator(
+                      'input[placeholder*="Search" i]'
+                  )
+              )
+
+              if search_field is None:
+                  raise RuntimeError(
+                      "Project search field not found."
+                  )
+
+              search_field.fill(project_url)
+
+              print("Project URL entered.")
+
+              print("\nSTEP 14: Clicking Search")
+
+              search_button = unique_visible(
+                  page.get_by_role(
+                      "button",
+                      name=re.compile(
+                          r"^\s*Search\s*$",
+                          re.IGNORECASE,
+                      ),
+                  )
+              )
+
+              if search_button is None:
+                  raise RuntimeError(
+                      "Project Search button not found."
+                  )
+
+              search_button.click(timeout=15000)
+
+              print("Search submitted.")
+
+          def verify_project(page, context):
+              print(
+                  "\nSTEP 15: Checking project search result"
+              )
+
+              deadline = time.monotonic() + 40
+
+              expected_path = parsed_project.path.rstrip("/")
+
+              while time.monotonic() < deadline:
+                  pages = [
+                      p for p in context.pages
+                      if not p.is_closed()
+                  ]
+
+                  for candidate in pages:
+                      if current_path(candidate) == expected_path:
+                          print(
+                              "Expected project URL reached."
+                          )
+                          return candidate
+
+                  if current_path(page) in (
+                      "/login",
+                      "/switch-sub-users",
+                  ):
+                      raise RuntimeError(
+                          "Authentication was lost "
+                          "during project search."
+                      )
+
+                  time.sleep(2)
+
+              print(
+                  "Project did not open automatically."
+              )
+
+              print(
+                  "Current location:",
+                  safe_location(page),
+              )
+
+              print(
+                  "Visible Open Project controls:",
+                  len(
+                      visible_items(
+                          page.get_by_text(
+                              "Open Project",
+                              exact=True,
+                          )
+                      )
+                  ),
+              )
+
+              raise RuntimeError(
+                  "Project search did not reach "
+                  "the configured project URL."
+              )
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(
+                  headless=True
+              )
+
+              context = browser.new_context(
+                  viewport={
+                      "width": 1440,
+                      "height": 900,
+                  },
+                  accept_downloads=False,
+              )
+
+              page = context.new_page()
+
+              page.set_default_timeout(15000)
+
+              try:
+                  print("\nSTEP 1: Opening FlexiFunnels login")
+
+                  page.goto(
+                      "https://app.flexifunnels.com/login",
+                      wait_until="domcontentloaded",
+                      timeout=60000,
+                  )
+
+                  print("Location:", safe_location(page))
+
+                  print("\nSTEP 2: Finding login fields")
+
+                  email_field = find_login_field(
+                      page,
+                      [
+                          'input[type="email"]',
+                          'input[name="email"]',
+                          'input[autocomplete="username"]',
+                      ],
+                  )
+
+                  password_field = find_login_field(
+                      page,
+                      ['input[type="password"]'],
+                  )
+
+                  if email_field is None or password_field is None:
+                      raise RuntimeError(
+                          "Login fields were not found."
+                      )
+
+                  print("Login fields found.")
+
+                  print("\nSTEP 3: Entering credentials")
+
+                  email_field.fill(email)
+                  password_field.fill(password)
+
+                  print("Credentials entered.")
+
+                  print("\nSTEP 4: Finding login button")
+
+                  login_button = None
+
+                  for selector in [
+                      'button[type="submit"]',
+                      'input[type="submit"]',
+                      'button:has-text("Login")',
+                      'button:has-text("Log in")',
+                      'button:has-text("Sign in")',
+                  ]:
+                      candidate = unique_visible(
+                          page.locator(selector)
+                      )
+
+                      if candidate is not None:
+                          login_button = candidate
+                          break
+
+                  print("\nSTEP 5: Submitting login")
+
+                  if login_button is not None:
+                      login_button.click(timeout=15000)
+                  else:
+                      password_field.press("Enter")
+
+                  print("Login submitted.")
+
+                  print("\nSTEP 6: Opening sub-user selection")
+
+                  path = wait_for_path_change(
+                      page,
+                      "/login",
+                      seconds=25,
+                  )
+
+                  if path == "/login":
+                      page.goto(
+                          project_url,
+                          wait_until="domcontentloaded",
+                          timeout=60000,
+                      )
+
+                  page.wait_for_timeout(3000)
+
+                  print(
+                      "Current location:",
+                      safe_location(page),
+                  )
+
+                  if current_path(page) != "/switch-sub-users":
+                      raise RuntimeError(
+                          "Sub-user selection page "
+                          "was not displayed."
+                      )
+
+                  print(
+                      "SUB-USER SELECTION SCREEN DETECTED"
+                  )
+
+                  select_saurabh(page)
+
+                  switched_page = locate_switched_page(
+                      context,
+                      page,
+                  )
+
+                  switched_page.set_default_timeout(15000)
+
+                  open_projects(switched_page)
+
+                  choose_project_url_filter(switched_page)
+
+                  search_project(switched_page)
+
+                  verify_project(switched_page, context)
+
+                  print("\n" + "=" * 60)
+                  print("SUCCESS: FLEXIFUNNELS LOGIN VERIFIED")
+                  print("SUCCESS: SAURABH SUB-USER SELECTED")
+                  print("SUCCESS: PROJECTS PAGE ACCESS VERIFIED")
+                  print("SUCCESS: PROJECT URL SEARCH COMPLETED")
+                  print("SUCCESS: TARGET PROJECT OPENED")
+                  print("NO REPORTS DOWNLOADED")
+                  print("NO GOOGLE SHEETS MODIFIED")
+                  print("=" * 60)
+
+              except Exception as exc:
+                  print("\n" + "=" * 60)
+                  print("FLEXIFUNNELS TEST FAILED")
+                  print("Error type:", type(exc).__name__)
+                  print("Last location:", safe_location(page))
+                  print("=" * 60)
+
+                  raise RuntimeError(
+                      "FlexiFunnels login, sub-user switch, "
+                      "or project search failed. "
+                      "Review the numbered steps above."
+                  ) from None
+
+              finally:
+                  context.close()
+                  browser.close()
+
+                  print("\nBrowser closed.")
           PY
