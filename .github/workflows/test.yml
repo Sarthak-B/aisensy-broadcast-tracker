@@ -27,7 +27,7 @@ jobs:
           pip install playwright gspread google-auth
           python -m playwright install --with-deps chromium
 
-      - name: Check latest sent broadcasts and add new campaigns only
+      - name: Check latest broadcasts and refresh a small metrics batch
         env:
           AISENSY_SESSION: ${{ secrets.AISENSY_SESSION }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
@@ -50,6 +50,7 @@ jobs:
           PROJECT_ID = '6589906ef69fc70b424e0e43'
           LIST_URL = f'https://www.app.aisensy.com/projects/{PROJECT_ID}/campaigns/all'
           MAX_CAMPAIGNS = 5
+          METRICS_BATCH_SIZE = 5
           MAX_DISCOVERY_PAGES = 3
           SHEET_ID = os.environ.get('GOOGLE_SHEET_ID', '').strip() or '1jXnQPQngi-FbEBBHC0tvaOTXxmtE5_miv6Mq0rTbmLQ'
           IST = ZoneInfo('Asia/Kolkata')
@@ -89,6 +90,43 @@ jobs:
           def money(body):
               match = re.search(r'(?im)^\s*Total Credit Usage\s*\n\s*₹\s*([\d,]+(?:\.\d+)?)', body)
               return number(match.group(1)) if match else None
+
+          def clicked_count(body, payloads, campaign_id):
+              direct = metric(body, 'Clicked')
+              if direct is not None:
+                  return direct
+              match = re.search(r'(?i)[\d.]+\s*%\s*\(\s*([\d,]+)\s*\)\s*(?:PRO\s*)?Clicked\b', body)
+              if match:
+                  return count(match.group(1))
+              values = set()
+              def walk(value):
+                  if isinstance(value, list):
+                      for item in value:
+                          walk(item)
+                  elif isinstance(value, dict):
+                      fields = {re.sub(r'[^a-z0-9]', '', str(k).lower()): v for k, v in value.items()}
+                      identities = [str(fields[k]) for k in ('id', 'campaignid', 'broadcastid') if k in fields]
+                      if campaign_id in identities and not any(k in fields for k in ('messageid', 'contactid', 'recipientid')):
+                          for field in ('clicked', 'clickedcount', 'clickcount', 'totalclicked'):
+                              raw = fields.get(field)
+                              if raw is not None and not isinstance(raw, bool) and re.fullmatch(r'\d+(?:\.0+)?', str(raw)):
+                                  values.add(int(float(raw)))
+                      for item in value.values():
+                          if isinstance(item, (dict, list)):
+                              walk(item)
+              for payload in payloads:
+                  walk(payload)
+              return next(iter(values)) if len(values) == 1 else None
+
+          def read_saved_clicks(ws):
+              if ws is None:
+                  return {}
+              rows = ws.get_all_values(value_render_option='UNFORMATTED_VALUE')
+              if not rows or 'Clicked' not in rows[0]:
+                  return {}
+              col = rows[0].index('Clicked')
+              return {str(row[0]).strip(): count(row[col]) for row in rows[1:]
+                      if row and len(row) > col and row[col] != ''}
 
           def failed_count(body):
               direct = metric(body, 'Failed')
@@ -658,7 +696,7 @@ jobs:
                   print(f'Optional content extraction failed for {campaign_id}: {type(exc).__name__}', flush=True)
                   return '', 'Content lookup failed; previous value retained', ''
 
-          def fetch_campaign(page, name, campaign_id=None):
+          def fetch_campaign(page, name, campaign_id=None, metrics_only=False):
               expected_id = campaign_id
               with campaign_responses(page) as payloads, content_responses(page) as content_payloads:
                   if campaign_id:
@@ -693,7 +731,7 @@ jobs:
                   missing = [key for key, value in values.items() if value is None]
                   if missing:
                       raise RuntimeError(f'Missing metrics for {name}: {missing}')
-                  if contents_by_id.get(campaign_id, {}).get('Message Content') and contents_by_id[campaign_id].get('Content Source') == f'Campaign {campaign_id} | Preview v11':
+                  if metrics_only or (contents_by_id.get(campaign_id, {}).get('Message Content') and contents_by_id[campaign_id].get('Content Source') == f'Campaign {campaign_id} | Preview v11'):
                       message_content, content_status, content_source = '', '', ''
                   else:
                       message_content, content_status, content_source = fetch_broadcast_content(page, content_payloads, campaign_id)
@@ -706,6 +744,7 @@ jobs:
                       'Broadcast Sent At (IST)': resolve_sent_time(body, payloads, campaign_id),
                       'Campaign Type': kind.group(1) if kind else 'BROADCAST',
                       **values,
+                      'Clicked': clicked_count(body, payloads, campaign_id),
                       'Cost per Message': (values['Actual Cost'] / values['Sent']) if values['Sent'] else 0.0,
                       'Estimated Cost': '',
                       'Last Updated': ist_now(),
@@ -775,6 +814,29 @@ jobs:
 
           def newest_activity(rec):
               return max(chronological_time(date_with_time(rec)), chronological_time(rec.get('Last Updated')))
+
+          def metric_batch(ids, cursor, limit):
+              ids = sorted(set(ids))
+              if not ids:
+                  return [], ''
+              start = ids.index(cursor) if cursor in ids else next((i for i, cid in enumerate(ids) if cid > cursor), 0)
+              size = min(limit, len(ids))
+              return [ids[(start+i) % len(ids)] for i in range(size)], ids[(start+size) % len(ids)]
+
+          def persist_metric_cursor(cursor):
+              if cursor == metric_cursor:
+                  return
+              if metric_cursor_entry:
+                  request = {'updateDeveloperMetadata': {
+                      'dataFilters': [{'developerMetadataLookup': {'metadataId': metric_cursor_entry['metadataId']}}],
+                      'developerMetadata': {'metadataValue': cursor}, 'fields': 'metadataValue',
+                  }}
+              else:
+                  request = {'createDeveloperMetadata': {'developerMetadata': {
+                      'metadataKey': 'aisensy_metrics_cursor', 'metadataValue': cursor,
+                      'location': {'spreadsheet': True}, 'visibility': 'DOCUMENT',
+                  }}}
+              spreadsheet.batch_update({'requests': [request]})
 
           def sort_campaign_rows(ws, positions, desired_ids):
               # Move whole rows so custom notes/columns stay with their campaign.
@@ -846,8 +908,14 @@ jobs:
 
           sheets_by_title = {ws.title: ws for ws in spreadsheet.worksheets()}
           sync_metadata = spreadsheet.fetch_sheet_metadata()
+          metric_cursor_entries = [entry for entry in sync_metadata.get('developerMetadata', []) if entry.get('metadataKey') == 'aisensy_metrics_cursor']
+          metric_cursor_entry = metric_cursor_entries[0] if metric_cursor_entries else None
+          metric_cursor = metric_cursor_entry.get('metadataValue', '') if metric_cursor_entry else ''
+          next_metric_cursor = metric_cursor
+
           analysis_ws = sheets_by_title.get('Broadcast Analysis')
           source_times = read_analysis_times(analysis_ws) if analysis_ws else {}
+          saved_clicks = read_saved_clicks(analysis_ws)
           contents_ws = sheets_by_title.get('Broadcast Contents')
           contents_by_id = {}
           if contents_ws:
@@ -868,6 +936,7 @@ jobs:
                   continue
               rec = existing_record(row)
               cid = rec['Campaign ID']
+              rec['Clicked'] = saved_clicks.get(cid)
               if not rec['Broadcast Sent At (IST)']:
                   rec['Broadcast Sent At (IST)'] = source_times.get(cid, '')
               if cid not in existing_by_id:
@@ -882,12 +951,22 @@ jobs:
               list_page = context.new_page()
               page = context.new_page()
               fetched, list_available = discover_new_broadcasts(list_page, page, existing_by_id)
+              selected, next_metric_cursor = metric_batch(
+                  [cid for cid in order if re.fullmatch(r'[A-Za-z0-9]+', cid)], metric_cursor, METRICS_BATCH_SIZE)
+              print(f'Checking metrics only for {len(selected)} saved broadcast(s); saved content is not fetched.', flush=True)
+              for cid in selected:
+                  try:
+                      fetched.append(fetch_campaign(page, existing_by_id[cid]['Campaign Name'], campaign_id=cid, metrics_only=True))
+                  except Exception as exc:
+                      print(f'WARNING: Metrics check failed for {cid}; saved data retained: {exc}', flush=True)
+
               browser.close()
 
           if not list_available:
               raise RuntimeError('AiSensy campaign list returned no names. Session may have expired or the page changed; spreadsheet was not modified.')
           if not fetched:
-              print('Nothing was updated: no new sent broadcasts were captured. All sheets left unchanged.', flush=True)
+              persist_metric_cursor(next_metric_cursor)
+              print('No updates saved: 0 new added; 0 existing updated. See warnings for any failed checks.', flush=True)
               sys.exit(0)
           sync_time = ist_now()
           new_ids = {rec['Campaign ID'] for rec in fetched if rec['Campaign ID'] not in existing_by_id}
@@ -901,6 +980,7 @@ jobs:
 
           new_count = 0
           updated_count = 0
+          updated_campaign_names = []
           for rec in fetched:
               cid = rec['Campaign ID']
               if not rec.get('Broadcast Sent At (IST)'):
@@ -913,10 +993,13 @@ jobs:
                       rec['Broadcast Sent At (IST)'] = old.get('Broadcast Sent At (IST)', '')
                   if not rec.get('Broadcast Sent At (IST)'):
                       rec['Broadcast Sent At (IST)'] = rec.get('Displayed Campaign Time (IST)', '')
-                  tracked_fields = ('Campaign Name', 'Campaign Type', 'Audience Size', 'Sent', 'Delivered', 'Read', 'Failed', 'Actual Cost', 'Broadcast Sent At (IST)')
+                  if rec.get('Clicked') is None:
+                      rec['Clicked'] = old.get('Clicked')
+                  tracked_fields = ('Campaign Name', 'Campaign Type', 'Audience Size', 'Sent', 'Delivered', 'Read', 'Failed', 'Actual Cost', 'Broadcast Sent At (IST)', 'Clicked')
                   changed = date_with_time(rec) != date_with_time(old) or any(rec.get(field, '') != old.get(field, '') for field in tracked_fields)
                   if changed:
                       updated_count += 1
+                      updated_campaign_names.append(rec['Campaign Name'])
                   else:
                       rec['Last Updated'] = old.get('Last Updated', rec['Last Updated'])
               else:
@@ -925,6 +1008,14 @@ jobs:
                   order.append(cid)
                   new_count += 1
               existing_by_id[cid] = rec
+
+          if not new_count and not updated_count:
+              persist_metric_cursor(next_metric_cursor)
+              print('Nothing was updated: 0 new added; 0 existing updated. Sheets left unchanged.', flush=True)
+              sys.exit(0)
+          print(f'{new_count} new added; {updated_count} existing broadcast(s) updated.', flush=True)
+          if updated_campaign_names:
+              print('Updated existing broadcasts: ' + ', '.join(updated_campaign_names), flush=True)
 
           # Add new broadcasts above existing rows. Never promote older history.
           latest_records = sorted((existing_by_id[cid] for cid in new_ids),
@@ -983,7 +1074,7 @@ jobs:
               ['Overall Read Rate', total_read / total_delivered if total_delivered else 0],
               ['Average Cost per Sent Message', total_cost / total_sent if total_sent else 0],
               ['Last Sync (IST)', sync_time],
-              ['Campaigns Added This Sync', new_count, f'{new_count} new campaign(s) added; {updated_count} existing campaign(s) refreshed'],
+              ['Campaigns Added This Sync', new_count, f'{new_count} new campaign(s) added; {updated_count} existing campaign(s) updated'],
               ['CAMPAIGN PERFORMANCE'],
               ['Campaign Name', 'Date', 'Sent', 'Delivered', 'Read', 'Failed', 'Delivery Rate', 'Read Rate', 'Actual Cost (INR)'],
           ]
@@ -1034,6 +1125,7 @@ jobs:
               'Webinar Date (inferred)', 'Hours Before Start', 'Timing Stage (inferred)',
               'Message Type', 'Content Angle', 'Delivery Rate', 'Read Rate',
               'Cost per Read', 'Data Status', 'Ranked', 'Data Check',
+              'Clicked', 'Click Rate (Clicked / Delivered)',
           ]
           analysis_rows = []
           for rec in records:
@@ -1119,11 +1211,13 @@ jobs:
                   cost / read if read else '', status,
                   'Yes' if final and sent >= 200 and message_type != 'Renewal offer' and not issues else 'No',
                   '; '.join(issues),
+                  rec.get('Clicked') if rec.get('Clicked') is not None else '',
+                  rec['Clicked'] / delivered if rec.get('Clicked') is not None and delivered else '',
               ])
           if analysis_ws.col_count < len(analysis_headers):
               analysis_ws.add_cols(len(analysis_headers) - analysis_ws.col_count)
           ensure_rows(analysis_ws, len(analysis_rows) + 1)
-          upsert_table(analysis_ws, analysis_headers, analysis_rows, 'Y')
+          upsert_table(analysis_ws, analysis_headers, analysis_rows, 'AA')
           spreadsheet.batch_update({'requests': [{'setDataValidation': {'range': {'sheetId': analysis_ws.id}, 'rule': None}}]})
           analysis_ws.freeze(rows=1)
           analysis_ws.format(f'C2:G{len(analysis_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
@@ -1132,6 +1226,8 @@ jobs:
               analysis_ws.format(f'{col}2:{col}{len(analysis_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0.00'}})
           for col in ('I', 'J', 'M', 'O'):
               analysis_ws.format(f'{col}2:{col}{len(analysis_rows)+1}', {'numberFormat': {'type': 'TEXT'}})
+          analysis_ws.format(f'Z2:Z{len(analysis_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
+          analysis_ws.format(f'AA2:AA{len(analysis_rows)+1}', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
           analysis_ws.format(f'L2:L{len(analysis_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '0'}})
           analysis_ws.format(f'P2:P{len(analysis_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '0.00'}})
 
@@ -1293,6 +1389,8 @@ jobs:
               {'updateDimensionProperties': {'range': {'sheetId': contents_ws.id, 'dimension': 'COLUMNS', 'startIndex': 1, 'endIndex': 3}, 'properties': {'pixelSize': 260}, 'fields': 'pixelSize'}},
               {'autoResizeDimensions': {'dimensions': {'sheetId': contents_ws.id, 'dimension': 'ROWS', 'startIndex': 1, 'endIndex': len(content_rows)+1}}},
           ]})
+
+          persist_metric_cursor(next_metric_cursor)
 
           print(f'Sync complete: {new_count} new, {updated_count} updated, {len(records)} total campaigns.', flush=True)
           PY
