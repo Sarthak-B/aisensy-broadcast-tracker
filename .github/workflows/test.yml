@@ -50,6 +50,7 @@ jobs:
           LIST_URL = f'https://www.app.aisensy.com/projects/{PROJECT_ID}/campaigns/all'
           MAX_CAMPAIGNS = 5
           HISTORICAL_BATCH_SIZE = 5
+          MAX_DISCOVERY_PAGES = 10
           SHEET_ID = os.environ.get('GOOGLE_SHEET_ID', '').strip() or '1jXnQPQngi-FbEBBHC0tvaOTXxmtE5_miv6Mq0rTbmLQ'
           IST = ZoneInfo('Asia/Kolkata')
 
@@ -305,8 +306,6 @@ jobs:
                       continue
                   if candidate not in names:
                       names.append(candidate)
-                  if len(names) >= MAX_CAMPAIGNS:
-                      break
               return names
 
           def wait_for_list(page):
@@ -314,22 +313,108 @@ jobs:
               page.get_by_text('Rows per page:', exact=False).first.wait_for(timeout=30000)
               page.wait_for_timeout(1400)
 
-          def discover_names(page):
-              best = []
-              for attempt in range(1, 4):
-                  wait_for_list(page)
-                  current = extract_names(page.locator('body').inner_text())
-                  print(f'Campaign discovery attempt {attempt}: found {len(current)}', flush=True)
-                  if len(current) > len(best):
-                      best = current
-                  if len(best) >= MAX_CAMPAIGNS:
-                      break
-                  page.wait_for_timeout(1700 * attempt)
-              if not best:
-                  print('No campaigns detected; no spreadsheet changes will be made.', flush=True)
-              elif len(best) < MAX_CAMPAIGNS:
-                  print(f'Continuing with {len(best)} available campaign(s), not requiring five.', flush=True)
-              return best[:MAX_CAMPAIGNS]
+          def campaign_list_records(payloads):
+              result = {}
+              def normalize(key):
+                  return re.sub(r'[^a-z0-9]', '', str(key).lower())
+              def walk(value):
+                  if isinstance(value, list):
+                      for item in value:
+                          walk(item)
+                  elif isinstance(value, dict):
+                      fields = {normalize(k): v for k, v in value.items()}
+                      kind = str(fields.get('campaigntype') or fields.get('type') or '').upper()
+                      cid = fields.get('campaignid') or fields.get('id')
+                      name = fields.get('campaignname') or fields.get('name')
+                      if kind == 'BROADCAST' and isinstance(cid, str) and isinstance(name, str) and re.fullmatch(r'[A-Za-z0-9]+', cid):
+                          result[cid] = name
+                      for item in value.values():
+                          if isinstance(item, (dict, list)):
+                              walk(item)
+              for payload in payloads:
+                  walk(payload)
+              return list(result.items())
+
+          def next_campaign_page(page):
+              locator = page.get_by_role('button', name=re.compile(r'^(?:go to |navigate to )?next(?: page)?$', re.I))
+              if locator.count() == 1:
+                  if not locator.is_enabled():
+                      return False
+                  locator.click(timeout=5000)
+                  page.wait_for_timeout(1000)
+                  return True
+              # AiSensy's footer also renders an icon-only next-page button.
+              icon_button = page.locator('button').filter(has=page.locator('svg[data-testid="KeyboardArrowRightIcon"], svg[data-testid="ChevronRightIcon"]'))
+              if icon_button.count() == 1 and icon_button.is_enabled():
+                  icon_button.click(timeout=5000)
+                  page.wait_for_timeout(1000)
+                  return True
+              return False
+
+          def discover_new_broadcasts(list_page, detail_page, saved):
+              fetched_new = []
+              seen_ids = set(saved)
+              saved_names = {rec['Campaign Name'] for rec in saved.values()}
+              inspected_names = set()
+              seen_pages = set()
+              attempts = 0
+              list_available = False
+              with campaign_responses(list_page) as payloads:
+                  wait_for_list(list_page)
+                  for page_number in range(1, MAX_DISCOVERY_PAGES + 1):
+                      body = list_page.locator('body').inner_text()
+                      fingerprint = body
+                      if fingerprint in seen_pages:
+                          break
+                      seen_pages.add(fingerprint)
+                      names = extract_names(body)
+                      entries = campaign_list_records(payloads)
+                      if names or entries:
+                          list_available = True
+                      print(f'Discovery page {page_number}: {len(entries)} campaign IDs, {len(names)} broadcast names.', flush=True)
+                      # API IDs distinguish duplicate names and already-saved rows.
+                      for cid, name in entries:
+                          if cid in seen_ids:
+                              continue
+                          seen_ids.add(cid)
+                          attempts += 1
+                          try:
+                              record = fetch_campaign(detail_page, name, campaign_id=cid)
+                              if record['Campaign ID'] not in saved:
+                                  fetched_new.append(record)
+                          except Exception as exc:
+                              print(f'WARNING: New broadcast {cid} not saved; will retry next run: {exc}', flush=True)
+                          if len(fetched_new) >= MAX_CAMPAIGNS or attempts >= MAX_CAMPAIGNS * 2:
+                              return fetched_new, list_available
+                      # Fallback for list responses without campaign IDs: click
+                      # unseen names on this page, then resolve the real view ID.
+                      if not entries:
+                          for name in names:
+                              if name in saved_names or name in inspected_names:
+                                  continue
+                              inspected_names.add(name)
+                              attempts += 1
+                              try:
+                                  target = list_page.get_by_text(name, exact=True).first
+                                  target.click(timeout=10000)
+                                  list_page.wait_for_url(re.compile(r'/campaigns/all/view/[A-Za-z0-9]+'), timeout=20000)
+                                  cid = re.search(r'/view/([A-Za-z0-9]+)', list_page.url).group(1)
+                                  if cid not in seen_ids:
+                                      seen_ids.add(cid)
+                                      fetched_new.append(fetch_campaign(detail_page, name, campaign_id=cid))
+                              except Exception as exc:
+                                  print(f'WARNING: Could not resolve new broadcast {name}; will retry next run: {exc}', flush=True)
+                              finally:
+                                  if '/view/' in list_page.url:
+                                      list_page.go_back(wait_until='domcontentloaded', timeout=20000)
+                                      list_page.get_by_text('Rows per page:', exact=False).first.wait_for(timeout=20000)
+                                      list_page.wait_for_timeout(500)
+                              if len(fetched_new) >= MAX_CAMPAIGNS or attempts >= MAX_CAMPAIGNS * 2:
+                                  return fetched_new, list_available
+                      if not next_campaign_page(list_page):
+                          break
+              print(f'Discovery complete: {len(fetched_new)} missing broadcast(s) fetched. Maximum {MAX_DISCOVERY_PAGES} list pages per run.', flush=True)
+              return fetched_new, list_available
 
           def content_from_campaign(body, payloads, campaign_id):
               candidates = []
@@ -606,7 +691,7 @@ jobs:
                   missing = [key for key, value in values.items() if value is None]
                   if missing:
                       raise RuntimeError(f'Missing metrics for {name}: {missing}')
-                  if contents_by_id.get(campaign_id, {}).get('Message Content') and 'placeholder' not in str(contents_by_id[campaign_id].get('Content Status', '')).lower():
+                  if contents_by_id.get(campaign_id, {}).get('Message Content'):
                       message_content, content_status, content_source = '', '', ''
                   else:
                       message_content, content_status, content_source = fetch_broadcast_content(page, content_payloads, campaign_id)
@@ -807,13 +892,9 @@ jobs:
           with sync_playwright() as playwright:
               browser = playwright.chromium.launch(headless=True)
               context = browser.new_context(storage_state=session, timezone_id='Asia/Kolkata')
+              list_page = context.new_page()
               page = context.new_page()
-              names = discover_names(page)
-              for name in names:
-                  try:
-                      fetched.append(fetch_campaign(page, name))
-                  except Exception as exc:
-                      print(f'WARNING: Skipped {name}: {exc}', flush=True)
+              fetched, list_available = discover_new_broadcasts(list_page, page, existing_by_id)
               # At most five older campaigns per run, rotating across all history.
               fetched_ids = {rec['Campaign ID'] for rec in fetched}
               candidates = [cid for cid in order if cid not in fetched_ids and re.fullmatch(r'[A-Za-z0-9]+', cid)]
@@ -827,10 +908,10 @@ jobs:
                       print(f'WARNING: Historical campaign {cid} could not be refreshed; saved row retained: {exc}', flush=True)
               browser.close()
 
-          if not names:
+          if not list_available:
               raise RuntimeError('AiSensy campaign list returned no names. Session may have expired or the page changed; spreadsheet was not modified.')
-          if not fetched:
-              raise RuntimeError('AiSensy campaigns were listed but none could be fetched. Spreadsheet was not modified.')
+          if not fetched and not existing_by_id:
+              raise RuntimeError('No broadcast records could be fetched. Spreadsheet was not modified.')
           sync_time = ist_now()
           new_ids = {rec['Campaign ID'] for rec in fetched if rec['Campaign ID'] not in existing_by_id}
 
@@ -872,7 +953,7 @@ jobs:
           # Checking an unchanged campaign does not change its Last Updated time.
           records = sorted(
               (existing_by_id[cid] for cid in order),
-              key=lambda rec: (newest_activity(rec), chronological_time(date_with_time(rec)), rec['Campaign ID']),
+              key=lambda rec: (1 if rec['Campaign ID'] in new_ids else 0, newest_activity(rec), chronological_time(date_with_time(rec)), rec['Campaign ID']),
               reverse=True,
           )
           missing_source_ids = set(source_times) - set(existing_by_id)
