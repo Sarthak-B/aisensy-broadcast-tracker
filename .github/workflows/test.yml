@@ -314,6 +314,82 @@ jobs:
                   print(f'Continuing with {len(best)} available campaign(s), not requiring five.', flush=True)
               return best[:MAX_CAMPAIGNS]
 
+          def content_from_campaign(body, payloads, campaign_id):
+              candidates = []
+              def clean_key(key):
+                  return re.sub(r'[^a-z0-9]', '', str(key).lower())
+              def template_text(template):
+                  if not isinstance(template, dict):
+                      return ''
+                  parts = []
+                  for component in (template.get('components') or []):
+                      if not isinstance(component, dict):
+                          continue
+                      text = component.get('text')
+                      if isinstance(text, str) and text.strip():
+                          parameters = (component.get('parameters') or [])
+                          for index, parameter in enumerate(parameters, 1):
+                              if isinstance(parameter, dict) and isinstance(parameter.get('text'), str):
+                                  text = text.replace('{{' + str(index) + '}}', parameter['text'])
+                          parts.append(text)
+                      for button in (component.get('buttons') or []):
+                          if isinstance(button, dict):
+                              label = button.get('text', '')
+                              url = button.get('url', '')
+                              if label or url:
+                                  parts.append(str(label) + (' — ' + str(url) if url else ''))
+                      for parameter in (component.get('parameters') or []):
+                          if isinstance(parameter, dict):
+                              for media_type in ('image', 'video', 'document'):
+                                  media = parameter.get(media_type)
+                                  if isinstance(media, dict) and media.get('link'):
+                                      parts.append(media_type.title() + ': ' + str(media['link']))
+                  return '\n\n'.join(parts)
+              def walk(value):
+                  if isinstance(value, list):
+                      for item in value:
+                          walk(item)
+                  elif isinstance(value, dict):
+                      ids = [str(v) for k, v in value.items() if clean_key(k) in {'id', 'campaignid', 'broadcastid'} and not isinstance(v, (dict, list))]
+                      if campaign_id in ids and not any(clean_key(k) in {'messageid', 'recipientid', 'contactid', 'phone', 'phonenumber'} for k in value):
+                          # Read text only from a campaign with the matching ID.
+                          for key, item in value.items():
+                              normalized = clean_key(key)
+                              if normalized in {'renderedmessage', 'messagecontent', 'messagetext', 'broadcastcontent', 'message'} and isinstance(item, str) and item.strip():
+                                  candidates.append((0, item.strip(), 'Campaign response'))
+                              elif normalized in {'template', 'messagetemplate', 'templatecontent'}:
+                                  text = template_text(item)
+                                  if text:
+                                      candidates.append((1, text, 'Template components'))
+                      for item in value.values():
+                          if isinstance(item, (dict, list)):
+                              walk(item)
+              for payload in payloads:
+                  walk(payload)
+              # Fallback to an explicitly labelled content block, not the whole
+              # analytics page. Stop at the next known analytics section.
+              lines = body.splitlines()
+              for index, line in enumerate(lines):
+                  if re.fullmatch(r'\s*(?:Message Content|Broadcast Content|Message Preview|Template Message)\s*:?\s*', line, re.I):
+                      parts = []
+                      for following in lines[index + 1:]:
+                          if re.fullmatch(r'\s*(?:Campaign Type|Campaign Name|Created At|Sent At|Total Credit Usage|Audience|Sent|Delivered|Read|Failed|Analytics|Campaign Details|Message Statistics|Status)\s*:?\s*', following, re.I):
+                              break
+                          parts.append(following)
+                      text = '\n'.join(parts).strip()
+                      if text:
+                          candidates.append((2, text, 'Labelled message preview'))
+              if not candidates:
+                  return '', 'Content unavailable', ''
+              candidates.sort(key=lambda item: item[0])
+              priority = candidates[0][0]
+              best = [item for item in candidates if item[0] == priority]
+              if len({item[1] for item in best}) != 1:
+                  return '', 'Conflicting content; previous value retained', ''
+              _, text, source = best[0]
+              status = 'Template placeholders remain' if re.search(r'{{.*?}}', text) else 'Captured'
+              return text, status, source
+
           def fetch_campaign(page, name):
               with campaign_responses(page) as payloads:
                   wait_for_list(page)
@@ -336,6 +412,7 @@ jobs:
                   missing = [key for key, value in values.items() if value is None]
                   if missing:
                       raise RuntimeError(f'Missing metrics for {name}: {missing}')
+                  message_content, content_status, content_source = content_from_campaign(body, payloads, campaign_id)
                   kind = re.search(r'(?im)^\s*Campaign Type\s*\n\s*([A-Z_]+)', body)
                   record = {
                       'Campaign ID': campaign_id,
@@ -347,6 +424,9 @@ jobs:
                       'Cost per Message': (values['Actual Cost'] / values['Sent']) if values['Sent'] else 0.0,
                       'Estimated Cost': '',
                       'Last Updated': ist_now(),
+                      'Message Content': message_content,
+                      'Content Status': content_status,
+                      'Content Source': content_source,
                   }
                   if not record['Broadcast Sent At (IST)']:
                       print(f'No usable explicit sent timestamp for {name}; retaining any historical value.', flush=True)
@@ -403,6 +483,14 @@ jobs:
           sheets_by_title = {ws.title: ws for ws in spreadsheet.worksheets()}
           analysis_ws = sheets_by_title.get('Broadcast Analysis')
           source_times = read_analysis_times(analysis_ws) if analysis_ws else {}
+          contents_ws = sheets_by_title.get('Broadcast Contents')
+          contents_by_id = {}
+          if contents_ws:
+              for row in contents_ws.get_all_records():
+                  cid = str(row.get('Campaign ID', '')).strip()
+                  if cid:
+                      contents_by_id[cid] = row
+
           webinar_ws = sheets_by_title.get('Webinar Dashboard')
           if analysis_ws is None and webinar_ws is None:
               raise RuntimeError('Neither Webinar Dashboard nor Broadcast Analysis exists; no spreadsheet changes were made.')
@@ -433,6 +521,33 @@ jobs:
                       fetched.append(fetch_campaign(page, name))
                   except Exception as exc:
                       print(f'WARNING: Skipped {name}: {exc}', flush=True)
+              # Capture missing historical content once. Future runs refresh
+              # only the same five discovered campaigns plus missing content.
+              if fetched:
+                  fetched_ids = {rec['Campaign ID'] for rec in fetched}
+                  consecutive_errors = 0
+                  for cid in order:
+                      if cid in fetched_ids or contents_by_id.get(cid, {}).get('Message Content'):
+                          continue
+                      if not re.fullmatch(r'[A-Za-z0-9]+', cid):
+                          continue
+                      try:
+                          with campaign_responses(page) as payloads:
+                              page.goto(f'{LIST_URL}/view/{cid}', wait_until='domcontentloaded', timeout=20000)
+                              page.get_by_text('Total Credit Usage', exact=True).first.wait_for(timeout=10000)
+                              page.wait_for_timeout(500)
+                              text, status, source = content_from_campaign(page.locator('body').inner_text(), payloads, cid)
+                          contents_by_id[cid] = {
+                              'Message Content': text, 'Content Status': status,
+                              'Content Source': source, 'Content Updated (IST)': ist_now() if text else '',
+                          }
+                          consecutive_errors = 0
+                      except Exception as exc:
+                          consecutive_errors += 1
+                          print(f'Historical content lookup skipped for {cid}: {type(exc).__name__}', flush=True)
+                          if consecutive_errors >= 3:
+                              print('Stopping historical content lookup after three consecutive errors.', flush=True)
+                              break
               browser.close()
 
           if not names:
@@ -694,13 +809,173 @@ jobs:
           analysis_ws.format(f'L2:L{len(analysis_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '0'}})
           analysis_ws.format(f'P2:P{len(analysis_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '0.00'}})
 
-          # Cleanup only the explicitly unwanted tabs, after report writes succeed.
-          if webinar_ws is not None:
-              spreadsheet.del_worksheet(webinar_ws)
-          for title in ('Message Tests', 'Dashboard Settings', 'Broadcast Schedule'):
+          # Keep one webinar dashboard, reusing the former schedule tab if present.
+          schedule_ws = sheets_by_title.get('Broadcast Schedule')
+          if webinar_ws is None:
+              if schedule_ws is not None:
+                  schedule_ws.update_title('Webinar Dashboard')
+                  webinar_ws = schedule_ws
+                  schedule_ws = None
+              else:
+                  webinar_ws = spreadsheet.add_worksheet(title='Webinar Dashboard', rows=120, cols=20)
+
+          # Summary figures use current records; timing groups remain inferred.
+          groups = {}
+          for row in analysis_rows:
+              webinar = row[13] or 'Unassigned / renewals'
+              if webinar not in groups:
+                  groups[webinar] = [0, 0, 0, 0, 0, 0.0]
+              group = groups[webinar]
+              for index, value in enumerate((1, row[3], row[4], row[5], row[6], row[7])):
+                  group[index] += value
+          webinar_rows = [
+              ['Webinar Broadcast Dashboard'],
+              ['Last refreshed (IST)', ist_now()],
+              ['Webinar matching is inferred from send time and the configured weekly schedule.'],
+              ['Metric', 'Value'],
+              ['Broadcasts', len(records)],
+              ['Messages sent', total_sent],
+              ['Messages delivered', total_delivered],
+              ['Messages read', total_read],
+              ['Messages failed', total_failed],
+              ['Actual cost (INR)', total_cost],
+              ['Delivery rate', total_delivered / total_sent if total_sent else 0],
+              ['Read rate', total_read / total_delivered if total_delivered else 0],
+              ['Cost per read (INR)', total_cost / total_read if total_read else ''],
+              ['Broadcasts with date and time', sum(bool(rec.get('Broadcast Sent At (IST)')) for rec in records)],
+              [],
+              ['Performance by webinar (inferred)'],
+              ['Webinar', 'Broadcasts', 'Sent', 'Delivered', 'Read', 'Failed', 'Actual Cost (INR)', 'Delivery Rate', 'Read Rate', 'Cost per Read'],
+          ]
+          for label, values in sorted(groups.items()):
+              broadcasts, sent, delivered, read, failed, cost = values
+              webinar_rows.append([label, broadcasts, sent, delivered, read, failed, cost,
+                                   delivered / sent if sent else 0, read / delivered if delivered else 0,
+                                   cost / read if read else ''])
+          message_heading = len(webinar_rows) + 2
+          webinar_rows += [[], ['Performance by message type'],
+                           ['Message Type', 'Broadcasts', 'Sent', 'Delivered', 'Read', 'Read Rate', 'Actual Cost (INR)', 'Cost per Read']]
+          message_groups = {}
+          for row in analysis_rows:
+              label = row[17]
+              group = message_groups.setdefault(label, [0, 0, 0, 0, 0.0])
+              for index, value in enumerate((1, row[3], row[4], row[5], row[7])):
+                  group[index] += value
+          for label, values in sorted(message_groups.items()):
+              broadcasts, sent, delivered, read, cost = values
+              webinar_rows.append([label, broadcasts, sent, delivered, read,
+                                   read / delivered if delivered else 0, cost, cost / read if read else ''])
+          top_heading = len(webinar_rows) + 2
+          webinar_rows += [[], ['Top mature broadcasts by read rate (minimum 200 sends)'],
+                           ['Campaign Name', 'Date and Time (IST)', 'Sent', 'Delivered', 'Read', 'Read Rate', 'Actual Cost (INR)', 'Cost per Read']]
+          eligible = sorted((row for row in analysis_rows if row[23] == 'Yes'), key=lambda row: row[20], reverse=True)[:10]
+          for row in eligible:
+              webinar_rows.append([row[1], row[9], row[3], row[4], row[5], row[20], row[7], row[21]])
+          if not eligible:
+              webinar_rows.append(['No broadcasts meet the maturity and volume criteria yet.'])
+          if webinar_ws.col_count < 20:
+              webinar_ws.add_cols(20 - webinar_ws.col_count)
+          ensure_rows(webinar_ws, max(100, len(webinar_rows)))
+          webinar_ws.clear()
+          update_values(webinar_ws, 'A1', webinar_rows)
+          spreadsheet.batch_update({'requests': [{'setDataValidation': {'range': {'sheetId': webinar_ws.id}, 'rule': None}}]})
+          webinar_ws.freeze(rows=1)
+          webinar_ws.format(f'A1:J{len(webinar_rows)}', {
+              'backgroundColor': {'red': 1, 'green': 1, 'blue': 1},
+              'textFormat': {'foregroundColor': {'red': 0.12, 'green': 0.16, 'blue': 0.2}, 'fontSize': 10},
+          })
+          webinar_ws.format('A1', {'textFormat': {'bold': True, 'fontSize': 18}})
+          for header_row in (4, 17, message_heading + 1, top_heading + 1):
+              webinar_ws.format(f'A{header_row}:J{header_row}', {
+                  'backgroundColor': {'red': 0.12, 'green': 0.3, 'blue': 0.27},
+                  'textFormat': {'bold': True, 'foregroundColor': {'red': 1, 'green': 1, 'blue': 1}},
+                  'wrapStrategy': 'WRAP',
+              })
+
+          webinar_ws.format('B11:B12', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
+          webinar_ws.format('B10', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0.00'}})
+          webinar_ws.format('B13', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0.00'}})
+          if groups:
+              webinar_ws.format(f'H18:I{17+len(groups)}', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
+              for col in ('G', 'J'):
+                  webinar_ws.format(f'{col}18:{col}{17+len(groups)}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0.00'}})
+          if message_groups:
+              start = message_heading + 2
+              webinar_ws.format(f'F{start}:F{start+len(message_groups)-1}', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
+          if eligible:
+              start = top_heading + 2
+              webinar_ws.format(f'F{start}:F{start+len(eligible)-1}', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
+
+          # Replace dashboard charts, preventing duplicate charts on every run.
+          chart_requests = []
+          metadata = spreadsheet.fetch_sheet_metadata()
+          for sheet in metadata.get('sheets', []):
+              if sheet.get('properties', {}).get('sheetId') == webinar_ws.id:
+                  for chart in sheet.get('charts', []):
+                      chart_requests.append({'deleteEmbeddedObject': {'objectId': chart['chartId']}})
+          def chart_range(start_col, end_col):
+              return {'sheetId': webinar_ws.id, 'startRowIndex': 16,
+                      'endRowIndex': 17 + len(groups), 'startColumnIndex': start_col, 'endColumnIndex': end_col}
+          if groups:
+              for title, columns, row_anchor in (
+                  ('Messages delivered and read by webinar', ((3, 4), (4, 5)), 3),
+                  ('Read rate by webinar', ((8, 9),), 22),
+              ):
+                  chart_requests.append({'addChart': {'chart': {
+                      'spec': {'title': title, 'basicChart': {
+                          'chartType': 'COLUMN', 'legendPosition': 'BOTTOM_LEGEND', 'headerCount': 1,
+                          'axis': [{'position': 'BOTTOM_AXIS', 'title': 'Webinar (inferred)'},
+                                   {'position': 'LEFT_AXIS', 'title': 'Read rate' if len(columns) == 1 else 'Messages'}],
+                          'domains': [{'domain': {'sourceRange': {'sources': [chart_range(0, 1)]}}}],
+                          'series': [{'series': {'sourceRange': {'sources': [chart_range(a, b)]}}, 'targetAxis': 'LEFT_AXIS'} for a, b in columns],
+                      }},
+                      'position': {'overlayPosition': {'anchorCell': {'sheetId': webinar_ws.id, 'rowIndex': row_anchor, 'columnIndex': 11},
+                                                       'widthPixels': 650, 'heightPixels': 350}},
+                  }}})
+          chart_requests += [
+              {'updateDimensionProperties': {'range': {'sheetId': webinar_ws.id, 'dimension': 'COLUMNS', 'startIndex': 0, 'endIndex': 1}, 'properties': {'pixelSize': 310}, 'fields': 'pixelSize'}},
+              {'updateDimensionProperties': {'range': {'sheetId': webinar_ws.id, 'dimension': 'COLUMNS', 'startIndex': 1, 'endIndex': 10}, 'properties': {'pixelSize': 140}, 'fields': 'pixelSize'}},
+          ]
+          spreadsheet.batch_update({'requests': chart_requests})
+
+          if contents_ws is None:
+              contents_ws = spreadsheet.add_worksheet(title='Broadcast Contents', rows=max(100, len(records)+1), cols=8)
+          content_headers = ['Campaign ID', 'Campaign Name', 'Date and Time (IST)', 'Message Content',
+                             'Content Status', 'Content Source', 'Content Updated (IST)', 'Metrics Updated (IST)']
+          content_rows = []
+          fetched_by_id = {rec['Campaign ID']: rec for rec in fetched}
+          for rec in records:
+              cid = rec['Campaign ID']
+              previous = contents_by_id.get(cid, {})
+              fresh = fetched_by_id.get(cid, {})
+              text = fresh.get('Message Content') or previous.get('Message Content', '')
+              status = fresh.get('Content Status') if fresh.get('Message Content') else previous.get('Content Status', 'Content unavailable')
+              source = fresh.get('Content Source') if fresh.get('Message Content') else previous.get('Content Source', '')
+              content_time = fresh.get('Last Updated') if fresh.get('Message Content') else previous.get('Content Updated (IST)', '')
+              # Google Sheets cells are limited to 50,000 characters. Never truncate silently.
+              if len(str(text)) > 50000:
+                  raise RuntimeError(f'Content exceeds the Google Sheets cell limit for {cid}; previous content tab retained.')
+              content_rows.append([cid, rec['Campaign Name'], date_with_time(rec), text, status, source, content_time, rec['Last Updated']])
+          ensure_rows(contents_ws, len(content_rows)+1)
+          if contents_ws.col_count < 8:
+              contents_ws.add_cols(8 - contents_ws.col_count)
+          contents_ws.clear()
+          update_values(contents_ws, f'A1:H{len(content_rows)+1}', [content_headers] + content_rows)
+          contents_ws.freeze(rows=1)
+          contents_ws.format(f'D2:D{len(content_rows)+1}', {'wrapStrategy': 'WRAP', 'verticalAlignment': 'TOP'})
+          spreadsheet.batch_update({'requests': [
+              {'updateDimensionProperties': {'range': {'sheetId': contents_ws.id, 'dimension': 'COLUMNS', 'startIndex': 3, 'endIndex': 4}, 'properties': {'pixelSize': 650}, 'fields': 'pixelSize'}},
+              {'updateDimensionProperties': {'range': {'sheetId': contents_ws.id, 'dimension': 'COLUMNS', 'startIndex': 1, 'endIndex': 3}, 'properties': {'pixelSize': 260}, 'fields': 'pixelSize'}},
+              {'autoResizeDimensions': {'dimensions': {'sheetId': contents_ws.id, 'dimension': 'ROWS', 'startIndex': 1, 'endIndex': len(content_rows)+1}}},
+          ]})
+
+          # Retain Broadcast Analysis and the new Webinar Dashboard.
+          for title in ('Message Tests', 'Dashboard Settings'):
               ws = sheets_by_title.get(title)
               if ws is not None:
                   spreadsheet.del_worksheet(ws)
+          if schedule_ws is not None:
+              spreadsheet.del_worksheet(schedule_ws)
 
           print(f'Sync complete: {new_count} new, {updated_count} updated, {len(records)} total campaigns.', flush=True)
           PY
