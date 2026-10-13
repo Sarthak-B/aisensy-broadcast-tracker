@@ -39,6 +39,7 @@ jobs:
           import os
           import re
           from contextlib import contextmanager
+          from datetime import timedelta
           from datetime import datetime, timezone
           from zoneinfo import ZoneInfo
           from playwright.sync_api import sync_playwright
@@ -68,7 +69,7 @@ jobs:
               except ValueError:
                   return value
 
-          HEADERS = ['Campaign ID', 'Campaign Name', 'Date', 'Campaign Type', 'Audience Size', 'Sent', 'Delivered', 'Read', 'Failed', 'Delivery Rate', 'Read Rate', 'Cost per Message', 'Estimated Cost', 'Actual Cost', 'Last Updated', 'Broadcast Sent At (IST)']
+          HEADERS = ['Campaign ID', 'Campaign Name', 'Date', 'Campaign Type', 'Audience Size', 'Sent', 'Delivered', 'Read', 'Failed', 'Delivery Rate', 'Read Rate', 'Cost per Message', 'Estimated Cost', 'Actual Cost', 'Last Updated']
 
           def number(value, default=0.0):
               try:
@@ -240,6 +241,39 @@ jobs:
           def resolve_sent_time(body, payloads, campaign_id):
               return sent_time_from_responses(payloads, campaign_id) or sent_time_from_body(body)
 
+          def source_time(value):
+              # Preserve the existing Broadcast Analysis values as requested.
+              # These values are not evidence of actual sending by themselves.
+              if isinstance(value, (int, float)) and not isinstance(value, bool):
+                  if 36526 <= value < 73416:
+                      local = datetime(1899, 12, 30) + timedelta(seconds=round(value * 86400))
+                      return local.strftime('%Y-%m-%d %I:%M:%S %p IST')
+                  return ''
+              return actual_sent_value(value)
+
+          def read_analysis_times(ws):
+              rows = ws.get_all_values(value_render_option='UNFORMATTED_VALUE')
+              if not rows:
+                  return {}
+              header = [str(v).strip() for v in rows[0]]
+              if 'Campaign ID' not in header or 'Sent At (IST)' not in header:
+                  raise RuntimeError('Broadcast Analysis lacks Campaign ID or Sent At (IST); cleanup was not performed.')
+              id_col, time_col = header.index('Campaign ID'), header.index('Sent At (IST)')
+              result = {}
+              for row in rows[1:]:
+                  if len(row) <= max(id_col, time_col):
+                      continue
+                  cid = str(row[id_col]).strip()
+                  value = source_time(row[time_col])
+                  if cid and value:
+                      if cid in result and result[cid] != value:
+                          raise RuntimeError(f'Conflicting source times for {cid}; cleanup was not performed.')
+                      result[cid] = value
+              return result
+
+          def date_with_time(rec):
+              return rec.get('Broadcast Sent At (IST)') or rec.get('Date', '')
+
           def extract_names(body):
               lines = [line.strip() for line in body.splitlines() if line.strip()]
               names = []
@@ -320,7 +354,7 @@ jobs:
                   return record
 
           def existing_record(row):
-              padded = list(row[:16]) + [''] * max(0, 16 - len(row))
+              padded = list(row[:15]) + [''] * max(0, 15 - len(row))
               rec = dict(zip(HEADERS, padded))
               for field in ('Audience Size', 'Sent', 'Delivered', 'Read', 'Failed'):
                   rec[field] = count(rec[field])
@@ -328,17 +362,20 @@ jobs:
                   rec[field] = number(rec[field])
               rec['Last Updated'] = existing_time_to_ist(rec.get('Last Updated', ''))
               rec['Campaign ID'] = str(rec['Campaign ID']).strip()
+              # Migrate a timestamp column from earlier versions before clearing it.
+              rec['Broadcast Sent At (IST)'] = str(row[15]).strip() if len(row) > 15 else ''
+              if not rec['Broadcast Sent At (IST)'] and ':' in str(rec['Date']):
+                  rec['Broadcast Sent At (IST)'] = str(rec['Date'])
               return rec
 
           def output_row(rec):
               sent, delivered, read = count(rec['Sent']), count(rec['Delivered']), count(rec['Read'])
               rate = number(rec['Actual Cost']) / sent if sent else 0.0
               return [
-                  rec['Campaign ID'], rec['Campaign Name'], rec['Date'], rec['Campaign Type'],
+                  rec['Campaign ID'], rec['Campaign Name'], date_with_time(rec), rec['Campaign Type'],
                   count(rec['Audience Size']), sent, delivered, read, count(rec['Failed']),
                   delivered / sent if sent else 0, read / delivered if delivered else 0,
                   rate, '', number(rec['Actual Cost']), rec['Last Updated'],
-                  rec.get('Broadcast Sent At (IST)', ''),
               ]
 
           def ensure_rows(ws, minimum):
@@ -363,6 +400,13 @@ jobs:
           summary_ws = spreadsheet.worksheet('Cost Summary')
           dashboard_ws = spreadsheet.worksheet('Dashboard')
 
+          sheets_by_title = {ws.title: ws for ws in spreadsheet.worksheets()}
+          analysis_ws = sheets_by_title.get('Broadcast Analysis')
+          source_times = read_analysis_times(analysis_ws) if analysis_ws else {}
+          webinar_ws = sheets_by_title.get('Webinar Dashboard')
+          # Snapshot only when removing dependencies. Keep existing cells/layout.
+          webinar_snapshot = webinar_ws.get_all_values() if webinar_ws and any(title in sheets_by_title for title in ('Broadcast Analysis', 'Message Tests', 'Dashboard Settings')) else None
+
           existing_rows = data_ws.get_all_values()
           existing_by_id = {}
           order = []
@@ -371,6 +415,8 @@ jobs:
                   continue
               rec = existing_record(row)
               cid = rec['Campaign ID']
+              if not rec['Broadcast Sent At (IST)']:
+                  rec['Broadcast Sent At (IST)'] = source_times.get(cid, '')
               if cid not in existing_by_id:
                   order.append(cid)
               existing_by_id[cid] = rec
@@ -387,32 +433,6 @@ jobs:
                       fetched.append(fetch_campaign(page, name))
                   except Exception as exc:
                       print(f'WARNING: Skipped {name}: {exc}', flush=True)
-              if fetched:
-                  fetched_ids = {rec['Campaign ID'] for rec in fetched}
-                  consecutive_errors = 0
-                  for cid in order:
-                      old = existing_by_id[cid]
-                      if cid in fetched_ids or old.get('Broadcast Sent At (IST)'):
-                          continue
-                      if not re.fullmatch(r'[A-Za-z0-9]+', cid):
-                          continue
-                      try:
-                          with campaign_responses(page) as payloads:
-                              page.goto(f'{LIST_URL}/view/{cid}', wait_until='domcontentloaded', timeout=20000)
-                              page.get_by_text('Total Credit Usage', exact=True).first.wait_for(timeout=10000)
-                              page.wait_for_timeout(500)
-                              body = page.locator('body').inner_text()
-                              sent_at = resolve_sent_time(body, payloads, cid)
-                          if sent_at:
-                              old['Broadcast Sent At (IST)'] = sent_at
-                              print(f'Backfilled actual sent time for {cid}: {sent_at}', flush=True)
-                          consecutive_errors = 0
-                      except Exception as exc:
-                          consecutive_errors += 1
-                          print(f'Optional sent-time backfill skipped for {cid}: {type(exc).__name__}', flush=True)
-                          if consecutive_errors >= 3:
-                              print('Stopping optional timestamp backfill after three consecutive failures.', flush=True)
-                              break
               browser.close()
 
           if not names:
@@ -433,11 +453,13 @@ jobs:
           updated_count = 0
           for rec in fetched:
               cid = rec['Campaign ID']
+              if not rec.get('Broadcast Sent At (IST)'):
+                  rec['Broadcast Sent At (IST)'] = source_times.get(cid, '')
               if cid in existing_by_id:
                   old = existing_by_id[cid]
                   if not rec['Date']:
                       rec['Date'] = old.get('Date', '')
-                  if not rec['Broadcast Sent At (IST)']:
+                  if not rec.get('Broadcast Sent At (IST)'):
                       rec['Broadcast Sent At (IST)'] = old.get('Broadcast Sent At (IST)', '')
                   updated_count += 1
               else:
@@ -452,21 +474,22 @@ jobs:
           records = sorted(
               (existing_by_id[cid] for cid in order),
               key=lambda rec: (
-                  str(rec.get('Date') or ''),
+                  str(date_with_time(rec))[:10],
                   1 if rec['Campaign ID'] in fetched_rank else 0,
                   -fetched_rank.get(rec['Campaign ID'], original_rank[rec['Campaign ID']]),
               ),
               reverse=True,
           )
+          missing_source_ids = set(source_times) - set(existing_by_id)
+          if missing_source_ids:
+              raise RuntimeError('Source times include campaigns missing from Broadcast_Data; no cleanup was performed.')
           data_rows = [output_row(rec) for rec in records]
-          if data_ws.col_count < 16:
-              data_ws.add_cols(16 - data_ws.col_count)
           ensure_rows(data_ws, len(data_rows) + 1)
-          update_values(data_ws, 'A1:P1', [HEADERS])
-          update_values(data_ws, f'A2:P{len(data_rows)+1}', data_rows)
+          update_values(data_ws, 'A1:O1', [HEADERS])
+          update_values(data_ws, f'A2:O{len(data_rows)+1}', data_rows)
           if len(existing_rows) > len(data_rows) + 1:
-              data_ws.batch_clear([f'A{len(data_rows)+2}:P{len(existing_rows)}'])
-          data_ws.format(f'P2:P{len(data_rows)+1}', {'numberFormat': {'type': 'TEXT'}})
+              data_ws.batch_clear([f'A{len(data_rows)+2}:O{len(existing_rows)}'])
+          data_ws.format(f'C2:C{len(data_rows)+1}', {'numberFormat': {'type': 'TEXT'}})
           data_ws.format(f'O2:O{len(data_rows)+1}', {'numberFormat': {'type': 'TEXT'}})
           data_ws.format(f'E2:I{len(data_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
           data_ws.format(f'J2:K{len(data_rows)+1}', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
@@ -476,7 +499,7 @@ jobs:
           summary_header = [
               'Campaign ID', 'Campaign Name', 'Date', 'Audience', 'Sent', 'Delivered',
               'Read', 'Failed', 'Actual Cost (INR)', 'Cost per Sent',
-              'Cost per Delivered', 'Last Updated', 'Broadcast Sent At (IST)',
+              'Cost per Delivered', 'Last Updated',
           ]
           summary_rows = []
           for rec in records:
@@ -484,20 +507,17 @@ jobs:
               delivered = count(rec['Delivered'])
               cost = number(rec['Actual Cost'])
               summary_rows.append([
-                  rec['Campaign ID'], rec['Campaign Name'], rec['Date'],
+                  rec['Campaign ID'], rec['Campaign Name'], date_with_time(rec),
                   count(rec['Audience Size']), sent, delivered, count(rec['Read']),
                   count(rec['Failed']), cost, cost / sent if sent else 0,
                   cost / delivered if delivered else 0, rec['Last Updated'],
-                  rec.get('Broadcast Sent At (IST)', ''),
               ])
           previous_summary = len(summary_ws.get_all_values())
-          if summary_ws.col_count < 13:
-              summary_ws.add_cols(13 - summary_ws.col_count)
           ensure_rows(summary_ws, len(summary_rows) + 1)
-          update_values(summary_ws, f'A1:M{len(summary_rows)+1}', [summary_header] + summary_rows)
+          update_values(summary_ws, f'A1:L{len(summary_rows)+1}', [summary_header] + summary_rows)
           if previous_summary > len(summary_rows) + 1:
-              summary_ws.batch_clear([f'A{len(summary_rows)+2}:M{previous_summary}'])
-          summary_ws.format(f'M2:M{len(summary_rows)+1}', {'numberFormat': {'type': 'TEXT'}})
+              summary_ws.batch_clear([f'A{len(summary_rows)+2}:L{previous_summary}'])
+          summary_ws.format(f'C2:C{len(summary_rows)+1}', {'numberFormat': {'type': 'TEXT'}})
           summary_ws.format(f'L2:L{len(summary_rows)+1}', {'numberFormat': {'type': 'TEXT'}})
           summary_ws.format(f'D2:H{len(summary_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
           summary_ws.format(f'I2:K{len(summary_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0.000'}})
@@ -523,31 +543,57 @@ jobs:
               ['Last Sync (IST)', sync_time],
               ['Campaigns Added This Sync', new_count, f'{new_count} new campaign(s) added; {updated_count} existing campaign(s) refreshed'],
               ['CAMPAIGN PERFORMANCE'],
-              ['Campaign Name', 'Date', 'Sent', 'Delivered', 'Read', 'Failed', 'Delivery Rate', 'Read Rate', 'Actual Cost (INR)', 'Broadcast Sent At (IST)'],
+              ['Campaign Name', 'Date', 'Sent', 'Delivered', 'Read', 'Failed', 'Delivery Rate', 'Read Rate', 'Actual Cost (INR)'],
           ]
           for rec in records:
               sent, delivered, read = count(rec['Sent']), count(rec['Delivered']), count(rec['Read'])
               dashboard.append([
-                  rec['Campaign Name'], rec['Date'], sent, delivered, read, count(rec['Failed']),
+                  rec['Campaign Name'], date_with_time(rec), sent, delivered, read, count(rec['Failed']),
                   delivered / sent if sent else 0, read / delivered if delivered else 0,
-                  number(rec['Actual Cost']), rec.get('Broadcast Sent At (IST)', ''),
+                  number(rec['Actual Cost']),
               ])
           previous_dashboard = len(dashboard_ws.get_all_values())
-          if dashboard_ws.col_count < 10:
-              dashboard_ws.add_cols(10 - dashboard_ws.col_count)
           ensure_rows(dashboard_ws, len(dashboard))
           dashboard_ws.batch_clear([f'A1:O{max(previous_dashboard, len(dashboard))}'])
           dashboard[12][1] = ist_now()  # Actual dashboard write time in IST
-          update_values(dashboard_ws, f'A1:J{len(dashboard)}', dashboard)
+          update_values(dashboard_ws, f'A1:I{len(dashboard)}', dashboard)
           dashboard_ws.format('B13', {'numberFormat': {'type': 'TEXT'}})
           dashboard_ws.format('B2:B7', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
           dashboard_ws.format('B10:B11', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
           dashboard_ws.format('B8:B9', {'numberFormat': {'type': 'CURRENCY', 'pattern': '₹#,##0.00'}})
           if records:
-              dashboard_ws.format(f'J17:J{16+len(records)}', {'numberFormat': {'type': 'TEXT'}})
+              dashboard_ws.format(f'B17:B{16+len(records)}', {'numberFormat': {'type': 'TEXT'}})
               dashboard_ws.format(f'C17:F{16+len(records)}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
               dashboard_ws.format(f'G17:H{16+len(records)}', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
               dashboard_ws.format(f'I17:I{16+len(records)}', {'numberFormat': {'type': 'CURRENCY', 'pattern': '₹#,##0.00'}})
+
+          # Clear only the timestamp columns added by earlier replacements.
+          # Do not delete columns, which could shift unrelated references.
+          for ws, col, label in (
+              (data_ws, 'P', 'Broadcast Sent At (IST)'),
+              (summary_ws, 'M', 'Broadcast Sent At (IST)'),
+          ):
+              if ws.acell(f'{col}1').value == label:
+                  ws.batch_clear([f'{col}1:{col}{ws.row_count}'])
+
+          if webinar_snapshot:
+              # Replacing dependent formulas with their displayed values keeps
+              # the current webinar report readable after its sources are removed.
+              width = max(len(row) for row in webinar_snapshot)
+              webinar_ws.clear()
+              update_values(webinar_ws, 'A1', [row + [''] * (width - len(row)) for row in webinar_snapshot])
+              spreadsheet.batch_update({'requests': [{
+                  'setDataValidation': {
+                      'range': {'sheetId': webinar_ws.id},
+                      'rule': None,
+                  }
+              }]})
+
+          # Cleanup is last: source times and reports have already been saved.
+          for title in ('Broadcast Analysis', 'Message Tests', 'Dashboard Settings'):
+              ws = sheets_by_title.get(title)
+              if ws is not None:
+                  spreadsheet.del_worksheet(ws)
 
           print(f'Sync complete: {new_count} new, {updated_count} updated, {len(records)} total campaigns.', flush=True)
           PY
