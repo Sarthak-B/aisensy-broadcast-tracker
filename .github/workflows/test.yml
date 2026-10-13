@@ -38,6 +38,7 @@ jobs:
           import json
           import os
           import re
+          from contextlib import contextmanager
           from datetime import datetime, timezone
           from zoneinfo import ZoneInfo
           from playwright.sync_api import sync_playwright
@@ -155,6 +156,90 @@ jobs:
                       return parsed.replace(tzinfo=tz).astimezone(IST).strftime('%Y-%m-%d %I:%M:%S %p IST')
               return ''
 
+          def actual_sent_value(value):
+              # Numeric API timestamps are Unix seconds or milliseconds.
+              if isinstance(value, bool) or value is None:
+                  return ''
+              if isinstance(value, (int, float)) or re.fullmatch(r'\d{10}(?:\.\d+)?|\d{13}', str(value).strip()):
+                  try:
+                      seconds = float(value)
+                      if seconds >= 1e12:
+                          seconds /= 1000
+                      parsed = datetime.fromtimestamp(seconds, timezone.utc)
+                      if 2000 <= parsed.year <= 2100:
+                          return parsed.astimezone(IST).strftime('%Y-%m-%d %I:%M:%S %p IST')
+                  except (ValueError, OverflowError, OSError):
+                      pass
+                  return ''
+              return sent_time_from_body('Sent At: ' + str(value))
+
+          @contextmanager
+          def campaign_responses(page):
+              payloads = []
+              def capture(response):
+                  # Read existing browser responses; no guessed API calls.
+                  if len(payloads) >= 100:
+                      return
+                  if not re.match(r'https://(?:[A-Za-z0-9-]+\.)*aisensy\.com/', response.url, re.I):
+                      return
+                  if not re.search(r'campaign|broadcast', response.url, re.I):
+                      return
+                  if response.request.resource_type not in ('xhr', 'fetch'):
+                      return
+                  try:
+                      if response.ok and 'json' in response.headers.get('content-type', '').lower():
+                          payload = response.json()
+                          if isinstance(payload, (dict, list)):
+                              payloads.append(payload)
+                  except Exception:
+                      pass  # Optional timestamp lookup cannot break metrics.
+              page.on('response', capture)
+              try:
+                  yield payloads
+              finally:
+                  page.remove_listener('response', capture)
+
+          def sent_time_from_responses(payloads, campaign_id):
+              allowed = {
+                  'sentat', 'senton', 'senttime', 'senttimestamp', 'sentdatetime',
+                  'broadcastsentat', 'broadcastsenttime', 'campaignsentat',
+                  'actualsentat', 'actualsenttime', 'actualsenttimestamp',
+              }
+              id_keys = {'id', 'campaignid', 'broadcastid'}
+              found = set()
+              observed_keys = set()
+              def normalized(key):
+                  return re.sub(r'[^a-z0-9]', '', str(key).lower())
+              def walk(value):
+                  if isinstance(value, list):
+                      for item in value:
+                          walk(item)
+                  elif isinstance(value, dict):
+                      ids = [str(v) for k, v in value.items() if normalized(k) in id_keys and not isinstance(v, (dict, list))]
+                      # Require a matching campaign object, never a recipient/message.
+                      if campaign_id in ids and not any(normalized(k) in {'messageid', 'contactid', 'recipientid', 'phone', 'phonenumber'} for k in value):
+                          observed_keys.update(str(k) for k in value if re.search(r'at$|time|date|sent', str(k), re.I))
+                          for key, item in value.items():
+                              if normalized(key) in allowed:
+                                  timestamp = actual_sent_value(item)
+                                  if timestamp:
+                                      found.add(timestamp)
+                      for item in value.values():
+                          if isinstance(item, (dict, list)):
+                              walk(item)
+              for payload in payloads:
+                  walk(payload)
+              if len(found) == 1:
+                  return next(iter(found))
+              if len(found) > 1:
+                  print(f'Conflicting explicit sent timestamps for {campaign_id}; retaining historical value.', flush=True)
+              elif observed_keys:
+                  print(f'No usable actual-sent field for {campaign_id}; timestamp field names: {sorted(observed_keys)}', flush=True)
+              return ''
+
+          def resolve_sent_time(body, payloads, campaign_id):
+              return sent_time_from_responses(payloads, campaign_id) or sent_time_from_body(body)
+
           def extract_names(body):
               lines = [line.strip() for line in body.splitlines() if line.strip()]
               names = []
@@ -196,42 +281,43 @@ jobs:
               return best[:MAX_CAMPAIGNS]
 
           def fetch_campaign(page, name):
-              wait_for_list(page)
-              target = page.get_by_text(name, exact=True).first
-              target.wait_for(timeout=20000)
-              target.click(timeout=20000)
-              page.wait_for_url(re.compile(r'/campaigns/all/view/[A-Za-z0-9]+'), timeout=30000)
-              page.get_by_text('Total Credit Usage', exact=True).first.wait_for(timeout=30000)
-              page.wait_for_timeout(500)
-              campaign_id = re.search(r'/view/([A-Za-z0-9]+)', page.url).group(1)
-              body = page.locator('body').inner_text()
-              values = {
-                  'Audience Size': metric(body, 'Audience'),
-                  'Sent': metric(body, 'Sent'),
-                  'Delivered': metric(body, 'Delivered'),
-                  'Read': metric(body, 'Read'),
-                  'Failed': failed_count(body),
-                  'Actual Cost': money(body),
-              }
-              missing = [key for key, value in values.items() if value is None]
-              if missing:
-                  raise RuntimeError(f'Missing metrics for {name}: {missing}')
-              kind = re.search(r'(?im)^\s*Campaign Type\s*\n\s*([A-Z_]+)', body)
-              record = {
-                  'Campaign ID': campaign_id,
-                  'Campaign Name': name,
-                  'Date': date_from_body(body),
-                  'Broadcast Sent At (IST)': sent_time_from_body(body),
-                  'Campaign Type': kind.group(1) if kind else 'BROADCAST',
-                  **values,
-                  'Cost per Message': (values['Actual Cost'] / values['Sent']) if values['Sent'] else 0.0,
-                  'Estimated Cost': '',
-                  'Last Updated': ist_now(),
-              }
-              if not record['Broadcast Sent At (IST)']:
-                  print(f'No usable explicit sent timestamp for {name}; retaining any historical value.', flush=True)
-              print(f"Fetched {name}: sent={record['Sent']}, delivered={record['Delivered']}, cost=INR {record['Actual Cost']}", flush=True)
-              return record
+              with campaign_responses(page) as payloads:
+                  wait_for_list(page)
+                  target = page.get_by_text(name, exact=True).first
+                  target.wait_for(timeout=20000)
+                  target.click(timeout=20000)
+                  page.wait_for_url(re.compile(r'/campaigns/all/view/[A-Za-z0-9]+'), timeout=30000)
+                  page.get_by_text('Total Credit Usage', exact=True).first.wait_for(timeout=30000)
+                  page.wait_for_timeout(500)
+                  campaign_id = re.search(r'/view/([A-Za-z0-9]+)', page.url).group(1)
+                  body = page.locator('body').inner_text()
+                  values = {
+                      'Audience Size': metric(body, 'Audience'),
+                      'Sent': metric(body, 'Sent'),
+                      'Delivered': metric(body, 'Delivered'),
+                      'Read': metric(body, 'Read'),
+                      'Failed': failed_count(body),
+                      'Actual Cost': money(body),
+                  }
+                  missing = [key for key, value in values.items() if value is None]
+                  if missing:
+                      raise RuntimeError(f'Missing metrics for {name}: {missing}')
+                  kind = re.search(r'(?im)^\s*Campaign Type\s*\n\s*([A-Z_]+)', body)
+                  record = {
+                      'Campaign ID': campaign_id,
+                      'Campaign Name': name,
+                      'Date': date_from_body(body),
+                      'Broadcast Sent At (IST)': resolve_sent_time(body, payloads, campaign_id),
+                      'Campaign Type': kind.group(1) if kind else 'BROADCAST',
+                      **values,
+                      'Cost per Message': (values['Actual Cost'] / values['Sent']) if values['Sent'] else 0.0,
+                      'Estimated Cost': '',
+                      'Last Updated': ist_now(),
+                  }
+                  if not record['Broadcast Sent At (IST)']:
+                      print(f'No usable explicit sent timestamp for {name}; retaining any historical value.', flush=True)
+                  print(f"Fetched {name}: sent={record['Sent']}, delivered={record['Delivered']}, cost=INR {record['Actual Cost']}", flush=True)
+                  return record
 
           def existing_record(row):
               padded = list(row[:16]) + [''] * max(0, 16 - len(row))
@@ -301,6 +387,32 @@ jobs:
                       fetched.append(fetch_campaign(page, name))
                   except Exception as exc:
                       print(f'WARNING: Skipped {name}: {exc}', flush=True)
+              if fetched:
+                  fetched_ids = {rec['Campaign ID'] for rec in fetched}
+                  consecutive_errors = 0
+                  for cid in order:
+                      old = existing_by_id[cid]
+                      if cid in fetched_ids or old.get('Broadcast Sent At (IST)'):
+                          continue
+                      if not re.fullmatch(r'[A-Za-z0-9]+', cid):
+                          continue
+                      try:
+                          with campaign_responses(page) as payloads:
+                              page.goto(f'{LIST_URL}/view/{cid}', wait_until='domcontentloaded', timeout=20000)
+                              page.get_by_text('Total Credit Usage', exact=True).first.wait_for(timeout=10000)
+                              page.wait_for_timeout(500)
+                              body = page.locator('body').inner_text()
+                              sent_at = resolve_sent_time(body, payloads, cid)
+                          if sent_at:
+                              old['Broadcast Sent At (IST)'] = sent_at
+                              print(f'Backfilled actual sent time for {cid}: {sent_at}', flush=True)
+                          consecutive_errors = 0
+                      except Exception as exc:
+                          consecutive_errors += 1
+                          print(f'Optional sent-time backfill skipped for {cid}: {type(exc).__name__}', flush=True)
+                          if consecutive_errors >= 3:
+                              print('Stopping optional timestamp backfill after three consecutive failures.', flush=True)
+                              break
               browser.close()
 
           if not names:
