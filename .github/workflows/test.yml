@@ -390,8 +390,170 @@ jobs:
               status = 'Template placeholders remain' if re.search(r'{{.*?}}', text) else 'Captured'
               return text, status, source
 
+          @contextmanager
+          def content_responses(page):
+              # Content may load from template endpoints, not campaign endpoints.
+              # This collector is separate from the unchanged timestamp collector.
+              payloads = []
+              def capture(response):
+                  if len(payloads) >= 150 or response.request.resource_type not in ('xhr', 'fetch'):
+                      return
+                  if not re.match(r'https://(?:[A-Za-z0-9-]+\.)*aisensy\.com/', response.url, re.I):
+                      return
+                  try:
+                      if response.ok and 'json' in response.headers.get('content-type', '').lower():
+                          value = response.json()
+                          if isinstance(value, (dict, list)):
+                              payloads.append(value)
+                  except Exception:
+                      pass
+              page.on('response', capture)
+              try:
+                  yield payloads
+              finally:
+                  page.remove_listener('response', capture)
+
+          def linked_template_content(payloads, campaign_id):
+              def key(value):
+                  return re.sub(r'[^a-z0-9]', '', str(value).lower())
+              objects = []
+              def walk(value):
+                  if isinstance(value, list):
+                      for item in value:
+                          walk(item)
+                  elif isinstance(value, dict):
+                      objects.append(value)
+                      for item in value.values():
+                          if isinstance(item, (dict, list)):
+                              walk(item)
+              for payload in payloads:
+                  walk(payload)
+              campaigns = [obj for obj in objects if campaign_id in [str(v) for k, v in obj.items() if key(k) in {'id', 'campaignid', 'broadcastid'} and not isinstance(v, (dict, list))]
+                           and not any(key(k) in {'messageid', 'contactid', 'recipientid', 'phone', 'phonenumber'} for k in obj)]
+              references = set()
+              templates = []
+              parameters = []
+              for campaign in campaigns:
+                  for k, value in campaign.items():
+                      if key(k) in {'template', 'templateid', 'templatename', 'messagetemplate', 'templatedata', 'templatecontent'}:
+                          if isinstance(value, dict):
+                              templates.append(value)
+                              references.update(str(v) for k2, v in value.items() if key(k2) in {'id', 'name', 'templatename', 'templateid'} and isinstance(v, str))
+                          elif isinstance(value, str):
+                              references.add(value)
+                      if key(k) in {'templateparams', 'templateparameters', 'bodyparameters', 'parameters'} and isinstance(value, list):
+                          parameters.append(value)
+              # Join template objects only by an exact campaign reference.
+              for obj in objects:
+                  identities = {str(v) for k, v in obj.items() if key(k) in {'id', 'name', 'templatename', 'templateid'} and isinstance(v, str)}
+                  if identities & references:
+                      templates.append(obj)
+              rendered = set()
+              for template in templates:
+                  parts = []
+                  for field in ('header', 'body', 'footer'):
+                      value = template.get(field)
+                      if isinstance(value, dict):
+                          value = value.get('text')
+                      if isinstance(value, str) and value.strip():
+                          parts.append(value.strip())
+                  components = template.get('components') or template.get('templateComponents') or []
+                  if isinstance(components, list):
+                      for component in components:
+                          if not isinstance(component, dict):
+                              continue
+                          text = component.get('text')
+                          if isinstance(text, str) and text.strip():
+                              parts.append(text.strip())
+                          buttons = component.get('buttons') or []
+                          if isinstance(buttons, list):
+                              for button in buttons:
+                                  if isinstance(button, dict) and button.get('text'):
+                                      parts.append(str(button['text']) + (' — ' + str(button['url']) if button.get('url') else ''))
+                  if not parts:
+                      for field in ('content', 'text', 'message'):
+                          value = template.get(field)
+                          if isinstance(value, str) and value.strip():
+                              parts.append(value.strip())
+                              break
+                  text = '\n\n'.join(parts)
+                  if text:
+                      # Substitute only a single unambiguous campaign parameter list.
+                      if len(parameters) == 1:
+                          for index, value in enumerate(parameters[0], 1):
+                              value = value.get('text') if isinstance(value, dict) else value
+                              if isinstance(value, str):
+                                  text = text.replace('{{' + str(index) + '}}', value)
+                      rendered.add(text)
+              if len(rendered) == 1:
+                  text = next(iter(rendered))
+                  status = 'Template placeholders remain' if re.search(r'{{.*?}}|\$FirstName|\$Name', text, re.I) else 'Captured template text'
+                  return text, status, 'Campaign-linked template response'
+              return '', 'Content unavailable', ''
+
+          def content_from_preview(page):
+              # AiSensy's published campaign screen places an unlabelled WhatsApp
+              # preview below the details card. Read that card, not body.inner_text.
+              return page.evaluate(r"""() => {
+                  const forbidden = /(?:^|\n)\s*(?:Campaign Type|Total Credit Usage|Campaign Messages \(per day\)|Rows per page:|Audience Size|Created At|Campaign Duration)\s*(?:\n|$)/i;
+                  const seeds = [];
+                  for (const el of document.querySelectorAll('img,svg,[class],[data-testid]')) {
+                      const hint = [el.getAttribute('alt'),el.getAttribute('src'),el.getAttribute('class'),el.getAttribute('data-testid')].filter(Boolean).join(' ');
+                      if (/whatsapp|message[-_ ]?preview|template[-_ ]?preview/i.test(hint)) seeds.push(el);
+                  }
+                  // The preview is a sibling below the campaign-details card.
+                  for (const el of document.querySelectorAll('span,p,div')) {
+                      if ((el.textContent || '').trim() !== 'Campaign Duration') continue;
+                      let parent = el;
+                      for (let i=0; parent && i<6; i++,parent=parent.parentElement) {
+                          if (parent.nextElementSibling) seeds.push(parent.nextElementSibling);
+                      }
+                  }
+                  const candidates = [];
+                  for (const seed of seeds) {
+                      let el = seed;
+                      for (let i=0; el && i<6; i++,el=el.parentElement) {
+                          if (el.tagName === 'BODY' || el.tagName === 'HTML') break;
+                          if (!el.getClientRects().length) continue;
+                          let text = (el.innerText || '').trim();
+                          if (text.length < 20 || text.length > 50000 || forbidden.test(text)) continue;
+                          if (/^(?:Manage|Live Chat|Contacts|Campaigns|History|All Projects)(?:\n|$)/i.test(text)) continue;
+                          const links = Array.from(el.querySelectorAll('a[href]')).map(a=>a.href).filter(u=>/^https?:/.test(u));
+                          const media = Array.from(el.querySelectorAll('img[src],video[src],video source[src]')).map(a=>a.src).filter(u=>/^https?:/.test(u) && !/logo|icon|whatsapp|avatar/i.test(u));
+                          const urls = [...new Set([...links,...media])];
+                          for (const url of urls) if (!text.includes(url)) text += '\n' + url;
+                          candidates.push(text);
+                      }
+                  }
+                  const unique = [...new Set(candidates)].sort((a,b)=>b.length-a.length);
+                  if (!unique.length) return '';
+                  if (unique.every(text=>unique[0].includes(text))) return unique[0];
+                  return ''; // Multiple unrelated candidates are not a safe preview.
+              }""")
+
+          def fetch_broadcast_content(page, payloads, campaign_id):
+              try:
+                  # Scrolling loads lazy-rendered previews below the overview cards.
+                  page.evaluate('() => window.scrollTo(0, document.body.scrollHeight)')
+                  page.wait_for_timeout(800)
+                  text = content_from_preview(page)
+                  if text:
+                      status = 'Template placeholders remain' if re.search(r'{{.*?}}|\$FirstName|\$Name', text, re.I) else 'Captured preview'
+                      return text, status, 'AiSensy WhatsApp message preview'
+                  result = content_from_campaign(page.locator('body').inner_text(), payloads, campaign_id)
+                  if result[0]:
+                      return result
+                  result = linked_template_content(payloads, campaign_id)
+                  if result[0]:
+                      return result
+                  print(f'Content preview/template unavailable for {campaign_id}; preserving any previous message.', flush=True)
+                  return '', 'Content unavailable', ''
+              except Exception as exc:
+                  print(f'Optional content extraction failed for {campaign_id}: {type(exc).__name__}', flush=True)
+                  return '', 'Content lookup failed; previous value retained', ''
+
           def fetch_campaign(page, name):
-              with campaign_responses(page) as payloads:
+              with campaign_responses(page) as payloads, content_responses(page) as content_payloads:
                   wait_for_list(page)
                   target = page.get_by_text(name, exact=True).first
                   target.wait_for(timeout=20000)
@@ -412,7 +574,7 @@ jobs:
                   missing = [key for key, value in values.items() if value is None]
                   if missing:
                       raise RuntimeError(f'Missing metrics for {name}: {missing}')
-                  message_content, content_status, content_source = content_from_campaign(body, payloads, campaign_id)
+                  message_content, content_status, content_source = fetch_broadcast_content(page, content_payloads, campaign_id)
                   kind = re.search(r'(?im)^\s*Campaign Type\s*\n\s*([A-Z_]+)', body)
                   record = {
                       'Campaign ID': campaign_id,
@@ -532,11 +694,11 @@ jobs:
                       if not re.fullmatch(r'[A-Za-z0-9]+', cid):
                           continue
                       try:
-                          with campaign_responses(page) as payloads:
+                          with campaign_responses(page) as payloads, content_responses(page) as content_payloads:
                               page.goto(f'{LIST_URL}/view/{cid}', wait_until='domcontentloaded', timeout=20000)
                               page.get_by_text('Total Credit Usage', exact=True).first.wait_for(timeout=10000)
                               page.wait_for_timeout(500)
-                              text, status, source = content_from_campaign(page.locator('body').inner_text(), payloads, cid)
+                              text, status, source = fetch_broadcast_content(page, content_payloads, cid)
                           contents_by_id[cid] = {
                               'Message Content': text, 'Content Status': status,
                               'Content Source': source, 'Content Updated (IST)': ist_now() if text else '',
