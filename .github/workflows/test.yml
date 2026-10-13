@@ -492,49 +492,60 @@ jobs:
               return '', 'Content unavailable', ''
 
           def content_from_preview(page):
-              # AiSensy's published campaign screen places an unlabelled WhatsApp
-              # preview below the details card. Read that card, not body.inner_text.
+              # The sent message is the white preview card shown below Overview.
+              # It contains prose, external links and optionally a video/image.
               return page.evaluate(r"""() => {
-                  const forbidden = /(?:^|\n)\s*(?:Campaign Type|Total Credit Usage|Campaign Messages \(per day\)|Rows per page:|Audience Size|Created At|Campaign Duration)\s*(?:\n|$)/i;
+                  const forbidden = /(?:^|\n)\s*(?:Campaign Type|Total Credit Usage|Campaign Messages \(per day\)|Rows per page:|Created At|Campaign Duration|Template Name)\s*(?:\n|$)/i;
                   const seeds = [];
-                  for (const el of document.querySelectorAll('img,svg,[class],[data-testid]')) {
-                      const hint = [el.getAttribute('alt'),el.getAttribute('src'),el.getAttribute('class'),el.getAttribute('data-testid')].filter(Boolean).join(' ');
-                      if (/whatsapp|message[-_ ]?preview|template[-_ ]?preview/i.test(hint)) seeds.push(el);
+                  for (const el of document.querySelectorAll('video,video source,a[href],img')) {
+                      const url = el.currentSrc || el.src || el.href || '';
+                      if (el.tagName === 'VIDEO' || el.tagName === 'SOURCE') seeds.push({el,priority:0});
+                      else if (el.tagName === 'A' && /^https?:/.test(url) && !/(?:^|\.)aisensy\.com$/.test(new URL(url).hostname)) seeds.push({el,priority:1});
+                      else if (el.tagName === 'IMG' && !/logo|icon|avatar/i.test(url)) seeds.push({el,priority:2});
                   }
-                  // The preview is a sibling below the campaign-details card.
-                  for (const el of document.querySelectorAll('span,p,div')) {
-                      if ((el.textContent || '').trim() !== 'Campaign Duration') continue;
-                      let parent = el;
-                      for (let i=0; parent && i<6; i++,parent=parent.parentElement) {
-                          if (parent.nextElementSibling) seeds.push(parent.nextElementSibling);
-                      }
+                  // Text-only broadcasts have no media; locate their greeting.
+                  for (const el of document.querySelectorAll('p,div,span')) {
+                      const text = (el.innerText || '').trim();
+                      if (/^(?:Dear|Hi|Hello)\b/i.test(text) && text.length >= 80 && !forbidden.test(text)) seeds.push({el,priority:0});
                   }
                   const candidates = [];
                   for (const seed of seeds) {
-                      let el = seed;
-                      for (let i=0; el && i<6; i++,el=el.parentElement) {
+                      let el = seed.el;
+                      for (let i=0; el && i<10; i++,el=el.parentElement) {
                           if (el.tagName === 'BODY' || el.tagName === 'HTML') break;
                           if (!el.getClientRects().length) continue;
-                          let text = (el.innerText || '').trim();
-                          if (text.length < 20 || text.length > 50000 || forbidden.test(text)) continue;
+                          const text = (el.innerText || '').trim();
+                          if (text.length < 80 || text.length > 48000 || forbidden.test(text)) continue;
                           if (/^(?:Manage|Live Chat|Contacts|Campaigns|History|All Projects)(?:\n|$)/i.test(text)) continue;
                           const links = Array.from(el.querySelectorAll('a[href]')).map(a=>a.href).filter(u=>/^https?:/.test(u));
-                          const media = Array.from(el.querySelectorAll('img[src],video[src],video source[src]')).map(a=>a.src).filter(u=>/^https?:/.test(u) && !/logo|icon|whatsapp|avatar/i.test(u));
-                          const urls = [...new Set([...links,...media])];
-                          for (const url of urls) if (!text.includes(url)) text += '\n' + url;
-                          candidates.push(text);
+                          const media = Array.from(el.querySelectorAll('video,video source,img[src]')).map(a=>a.currentSrc || a.src).filter(u=>u && /^https?:/.test(u) && !/logo|icon|avatar|whatsapp/i.test(u));
+                          candidates.push({text,priority:seed.priority,urls:[...new Set([...links,...media])]});
                       }
                   }
-                  const unique = [...new Set(candidates)].sort((a,b)=>b.length-a.length);
-                  if (!unique.length) return '';
-                  if (unique.every(text=>unique[0].includes(text))) return unique[0];
-                  return ''; // Multiple unrelated candidates are not a safe preview.
+                  if (!candidates.length) return '';
+                  const bestPriority = Math.min(...candidates.map(c=>c.priority));
+                  const ranked = candidates.filter(c=>c.priority === bestPriority).sort((a,b)=>b.text.length-a.text.length);
+                  const best = ranked[0];
+                  // Compare the text before appending URLs; media ancestors can
+                  // otherwise look like conflicting candidates for the same card.
+                  if (!ranked.every(c=>best.text.includes(c.text))) return '';
+                  let result = best.text;
+                  for (const url of best.urls) if (!result.includes(url)) result += '\n' + url;
+                  return result;
               }""")
 
           def fetch_broadcast_content(page, payloads, campaign_id):
               try:
                   # Scrolling loads lazy-rendered previews below the overview cards.
-                  page.evaluate('() => window.scrollTo(0, document.body.scrollHeight)')
+                  page.evaluate('''() => {
+                      window.scrollTo(0, document.body.scrollHeight);
+                      for (const el of document.querySelectorAll('main,section,div')) {
+                          const overflow = getComputedStyle(el).overflowY;
+                          if (/(auto|scroll)/.test(overflow) && el.scrollHeight > el.clientHeight) {
+                              el.scrollTop = el.scrollHeight;
+                          }
+                      }
+                  }''')
                   page.wait_for_timeout(800)
                   text = content_from_preview(page)
                   if text:
