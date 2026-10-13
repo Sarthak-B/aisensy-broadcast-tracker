@@ -27,7 +27,7 @@ jobs:
           pip install playwright gspread google-auth
           python -m playwright install --with-deps chromium
 
-      - name: Fetch up to 5 campaigns and update all sheets
+      - name: Discover latest 5 broadcasts and refresh all saved campaigns
         env:
           AISENSY_SESSION: ${{ secrets.AISENSY_SESSION }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
@@ -273,6 +273,22 @@ jobs:
 
           def date_with_time(rec):
               return rec.get('Broadcast Sent At (IST)') or rec.get('Date', '')
+
+          def displayed_campaign_time(body):
+              match = re.search(r'(?im)^\s*Created At\s*\n\s*([^\n]+)', body)
+              if not match:
+                  return ''
+              value = match.group(1).strip()
+              explicit = actual_sent_value(value)
+              if explicit:
+                  return explicit
+              for fmt in ('%b %d, %Y, %I:%M:%S %p', '%b %d, %Y, %I:%M %p',
+                          '%b %d, %Y %I:%M:%S %p', '%b %d, %Y %I:%M %p'):
+                  try:
+                      return datetime.strptime(value, fmt).strftime('%Y-%m-%d %I:%M:%S %p IST')
+                  except ValueError:
+                      pass
+              return ''
 
           def extract_names(body):
               lines = [line.strip() for line in body.splitlines() if line.strip()]
@@ -563,13 +579,17 @@ jobs:
                   print(f'Optional content extraction failed for {campaign_id}: {type(exc).__name__}', flush=True)
                   return '', 'Content lookup failed; previous value retained', ''
 
-          def fetch_campaign(page, name):
+          def fetch_campaign(page, name, campaign_id=None):
               with campaign_responses(page) as payloads, content_responses(page) as content_payloads:
-                  wait_for_list(page)
-                  target = page.get_by_text(name, exact=True).first
-                  target.wait_for(timeout=20000)
-                  target.click(timeout=20000)
-                  page.wait_for_url(re.compile(r'/campaigns/all/view/[A-Za-z0-9]+'), timeout=30000)
+                  if campaign_id:
+                      page.goto(f'{LIST_URL}/view/{campaign_id}', wait_until='domcontentloaded', timeout=30000)
+                      page.wait_for_url(re.compile(rf'/campaigns/all/view/{re.escape(campaign_id)}(?:[/?#]|$)'), timeout=30000)
+                  else:
+                      wait_for_list(page)
+                      target = page.get_by_text(name, exact=True).first
+                      target.wait_for(timeout=20000)
+                      target.click(timeout=20000)
+                      page.wait_for_url(re.compile(r'/campaigns/all/view/[A-Za-z0-9]+'), timeout=30000)
                   page.get_by_text('Total Credit Usage', exact=True).first.wait_for(timeout=30000)
                   page.wait_for_timeout(500)
                   campaign_id = re.search(r'/view/([A-Za-z0-9]+)', page.url).group(1)
@@ -585,12 +605,16 @@ jobs:
                   missing = [key for key, value in values.items() if value is None]
                   if missing:
                       raise RuntimeError(f'Missing metrics for {name}: {missing}')
-                  message_content, content_status, content_source = fetch_broadcast_content(page, content_payloads, campaign_id)
+                  if contents_by_id.get(campaign_id, {}).get('Message Content') and 'placeholder' not in str(contents_by_id[campaign_id].get('Content Status', '')).lower():
+                      message_content, content_status, content_source = '', '', ''
+                  else:
+                      message_content, content_status, content_source = fetch_broadcast_content(page, content_payloads, campaign_id)
                   kind = re.search(r'(?im)^\s*Campaign Type\s*\n\s*([A-Z_]+)', body)
                   record = {
                       'Campaign ID': campaign_id,
                       'Campaign Name': name,
                       'Date': date_from_body(body),
+                      'Displayed Campaign Time (IST)': displayed_campaign_time(body),
                       'Broadcast Sent At (IST)': resolve_sent_time(body, payloads, campaign_id),
                       'Campaign Type': kind.group(1) if kind else 'BROADCAST',
                       **values,
@@ -637,6 +661,48 @@ jobs:
 
           def update_values(ws, range_name, rows):
               ws.update(range_name=range_name, values=rows, value_input_option='RAW')
+
+          def same_cell(old, new):
+              if str(old or '') == str(new if new is not None else ''):
+                  return True
+              if isinstance(new, (int, float)) and not isinstance(new, bool):
+                  try:
+                      return abs(float(old) - new) <= 1e-9 * max(1, abs(new))
+                  except (ValueError, TypeError):
+                      pass
+              return False
+
+          def upsert_table(ws, headers, rows, end_col):
+              # Campaign ID is the key. Existing rows stay in place; new rows append.
+              existing = ws.get_all_values()
+              positions = {}
+              for index, row in enumerate(existing[1:], 2):
+                  if row and str(row[0]).strip():
+                      cid = str(row[0]).strip()
+                      if cid in positions:
+                          raise RuntimeError(f'Duplicate Campaign ID in {ws.title}: {cid}; table was not rewritten.')
+                      positions[cid] = index
+              updates = []
+              if not existing or existing[0][:len(headers)] != headers:
+                  updates.append({'range': f'A1:{end_col}1', 'values': [headers]})
+              next_row = max(2, len(existing) + 1)
+              for row in rows:
+                  cid = str(row[0]).strip()
+                  index = positions.get(cid)
+                  if index is None:
+                      index = next_row
+                      next_row += 1
+                      positions[cid] = index
+                      updates.append({'range': f'A{index}:{end_col}{index}', 'values': [row]})
+                  else:
+                      old = existing[index-1][:len(headers)]
+                      old += [''] * (len(headers) - len(old))
+                      if not all(same_cell(a, b) for a, b in zip(old, row)):
+                          updates.append({'range': f'A{index}:{end_col}{index}', 'values': [row]})
+              ensure_rows(ws, max(positions.values(), default=1))
+              # Bound request size while retaining unrelated cells and columns.
+              for start in range(0, len(updates), 100):
+                  ws.batch_update(updates[start:start+100], value_input_option='RAW')
 
           session_json = os.environ.get('AISENSY_SESSION', '').strip()
           google_json = (os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '').strip()
@@ -686,7 +752,7 @@ jobs:
           fetched = []
           with sync_playwright() as playwright:
               browser = playwright.chromium.launch(headless=True)
-              context = browser.new_context(storage_state=session)
+              context = browser.new_context(storage_state=session, timezone_id='Asia/Kolkata')
               page = context.new_page()
               names = discover_names(page)
               for name in names:
@@ -694,33 +760,17 @@ jobs:
                       fetched.append(fetch_campaign(page, name))
                   except Exception as exc:
                       print(f'WARNING: Skipped {name}: {exc}', flush=True)
-              # Capture missing historical content once. Future runs refresh
-              # only the same five discovered campaigns plus missing content.
-              if fetched:
-                  fetched_ids = {rec['Campaign ID'] for rec in fetched}
-                  consecutive_errors = 0
-                  for cid in order:
-                      if cid in fetched_ids or contents_by_id.get(cid, {}).get('Message Content'):
-                          continue
-                      if not re.fullmatch(r'[A-Za-z0-9]+', cid):
-                          continue
-                      try:
-                          with campaign_responses(page) as payloads, content_responses(page) as content_payloads:
-                              page.goto(f'{LIST_URL}/view/{cid}', wait_until='domcontentloaded', timeout=20000)
-                              page.get_by_text('Total Credit Usage', exact=True).first.wait_for(timeout=10000)
-                              page.wait_for_timeout(500)
-                              text, status, source = fetch_broadcast_content(page, content_payloads, cid)
-                          contents_by_id[cid] = {
-                              'Message Content': text, 'Content Status': status,
-                              'Content Source': source, 'Content Updated (IST)': ist_now() if text else '',
-                          }
-                          consecutive_errors = 0
-                      except Exception as exc:
-                          consecutive_errors += 1
-                          print(f'Historical content lookup skipped for {cid}: {type(exc).__name__}', flush=True)
-                          if consecutive_errors >= 3:
-                              print('Stopping historical content lookup after three consecutive errors.', flush=True)
-                              break
+              # Refresh all saved campaigns, including those outside the latest five.
+              fetched_ids = {rec['Campaign ID'] for rec in fetched}
+              for cid in order:
+                  if cid in fetched_ids or not re.fullmatch(r'[A-Za-z0-9]+', cid):
+                      continue
+                  try:
+                      rec = fetch_campaign(page, existing_by_id[cid]['Campaign Name'], campaign_id=cid)
+                      fetched.append(rec)
+                      fetched_ids.add(cid)
+                  except Exception as exc:
+                      print(f'WARNING: Historical campaign {cid} could not be refreshed; saved row retained: {exc}', flush=True)
               browser.close()
 
           if not names:
@@ -749,8 +799,17 @@ jobs:
                       rec['Date'] = old.get('Date', '')
                   if not rec.get('Broadcast Sent At (IST)'):
                       rec['Broadcast Sent At (IST)'] = old.get('Broadcast Sent At (IST)', '')
-                  updated_count += 1
+                  if not rec.get('Broadcast Sent At (IST)'):
+                      rec['Broadcast Sent At (IST)'] = rec.get('Displayed Campaign Time (IST)', '')
+                  tracked_fields = ('Campaign Name', 'Campaign Type', 'Audience Size', 'Sent', 'Delivered', 'Read', 'Failed', 'Actual Cost', 'Broadcast Sent At (IST)')
+                  changed = date_with_time(rec) != date_with_time(old) or any(rec.get(field, '') != old.get(field, '') for field in tracked_fields)
+                  if changed:
+                      updated_count += 1
+                  else:
+                      rec['Last Updated'] = old.get('Last Updated', rec['Last Updated'])
               else:
+                  if not rec.get('Broadcast Sent At (IST)'):
+                      rec['Broadcast Sent At (IST)'] = rec.get('Displayed Campaign Time (IST)', '')
                   order.append(cid)
                   new_count += 1
               existing_by_id[cid] = rec
@@ -772,11 +831,7 @@ jobs:
           if missing_source_ids:
               raise RuntimeError('Source times include campaigns missing from Broadcast_Data; no cleanup was performed.')
           data_rows = [output_row(rec) for rec in records]
-          ensure_rows(data_ws, len(data_rows) + 1)
-          update_values(data_ws, 'A1:O1', [HEADERS])
-          update_values(data_ws, f'A2:O{len(data_rows)+1}', data_rows)
-          if len(existing_rows) > len(data_rows) + 1:
-              data_ws.batch_clear([f'A{len(data_rows)+2}:O{len(existing_rows)}'])
+          upsert_table(data_ws, HEADERS, data_rows, 'O')
           data_ws.format(f'C2:C{len(data_rows)+1}', {'numberFormat': {'type': 'TEXT'}})
           data_ws.format(f'O2:O{len(data_rows)+1}', {'numberFormat': {'type': 'TEXT'}})
           data_ws.format(f'E2:I{len(data_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
@@ -800,11 +855,7 @@ jobs:
                   count(rec['Failed']), cost, cost / sent if sent else 0,
                   cost / delivered if delivered else 0, rec['Last Updated'],
               ])
-          previous_summary = len(summary_ws.get_all_values())
-          ensure_rows(summary_ws, len(summary_rows) + 1)
-          update_values(summary_ws, f'A1:L{len(summary_rows)+1}', [summary_header] + summary_rows)
-          if previous_summary > len(summary_rows) + 1:
-              summary_ws.batch_clear([f'A{len(summary_rows)+2}:L{previous_summary}'])
+          upsert_table(summary_ws, summary_header, summary_rows, 'L')
           summary_ws.format(f'C2:C{len(summary_rows)+1}', {'numberFormat': {'type': 'TEXT'}})
           summary_ws.format(f'L2:L{len(summary_rows)+1}', {'numberFormat': {'type': 'TEXT'}})
           summary_ws.format(f'D2:H{len(summary_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
@@ -969,8 +1020,7 @@ jobs:
           if analysis_ws.col_count < len(analysis_headers):
               analysis_ws.add_cols(len(analysis_headers) - analysis_ws.col_count)
           ensure_rows(analysis_ws, len(analysis_rows) + 1)
-          analysis_ws.clear()
-          update_values(analysis_ws, f'A1:Y{len(analysis_rows)+1}', [analysis_headers] + analysis_rows)
+          upsert_table(analysis_ws, analysis_headers, analysis_rows, 'Y')
           spreadsheet.batch_update({'requests': [{'setDataValidation': {'range': {'sheetId': analysis_ws.id}, 'rule': None}}]})
           analysis_ws.freeze(rows=1)
           analysis_ws.format(f'C2:G{len(analysis_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
@@ -1132,8 +1182,7 @@ jobs:
           ensure_rows(contents_ws, len(content_rows)+1)
           if contents_ws.col_count < 8:
               contents_ws.add_cols(8 - contents_ws.col_count)
-          contents_ws.clear()
-          update_values(contents_ws, f'A1:H{len(content_rows)+1}', [content_headers] + content_rows)
+          upsert_table(contents_ws, content_headers, content_rows, 'H')
           contents_ws.freeze(rows=1)
           contents_ws.format(f'D2:D{len(content_rows)+1}', {'wrapStrategy': 'WRAP', 'verticalAlignment': 'TOP'})
           spreadsheet.batch_update({'requests': [
@@ -1141,14 +1190,6 @@ jobs:
               {'updateDimensionProperties': {'range': {'sheetId': contents_ws.id, 'dimension': 'COLUMNS', 'startIndex': 1, 'endIndex': 3}, 'properties': {'pixelSize': 260}, 'fields': 'pixelSize'}},
               {'autoResizeDimensions': {'dimensions': {'sheetId': contents_ws.id, 'dimension': 'ROWS', 'startIndex': 1, 'endIndex': len(content_rows)+1}}},
           ]})
-
-          # Retain Broadcast Analysis and the new Webinar Dashboard.
-          for title in ('Message Tests', 'Dashboard Settings'):
-              ws = sheets_by_title.get(title)
-              if ws is not None:
-                  spreadsheet.del_worksheet(ws)
-          if schedule_ws is not None:
-              spreadsheet.del_worksheet(schedule_ws)
 
           print(f'Sync complete: {new_count} new, {updated_count} updated, {len(records)} total campaigns.', flush=True)
           PY
