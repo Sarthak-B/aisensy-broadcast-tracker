@@ -67,7 +67,7 @@ jobs:
               except ValueError:
                   return value
 
-          HEADERS = ['Campaign ID', 'Campaign Name', 'Date', 'Campaign Type', 'Audience Size', 'Sent', 'Delivered', 'Read', 'Failed', 'Delivery Rate', 'Read Rate', 'Cost per Message', 'Estimated Cost', 'Actual Cost', 'Last Updated']
+          HEADERS = ['Campaign ID', 'Campaign Name', 'Date', 'Campaign Type', 'Audience Size', 'Sent', 'Delivered', 'Read', 'Failed', 'Delivery Rate', 'Read Rate', 'Cost per Message', 'Estimated Cost', 'Actual Cost', 'Last Updated', 'Broadcast Sent At (IST)']
 
           def number(value, default=0.0):
               try:
@@ -103,6 +103,57 @@ jobs:
                   return datetime.strptime(match.group(1), '%b %d, %Y').strftime('%Y-%m-%d')
               except ValueError:
                   return ''
+
+          def sent_time_from_body(body):
+              # Only explicit actual-sent labels qualify. Never use creation,
+              # scheduled, updated, completion, or first-observed timestamps.
+              label = re.compile(r'^(?:Broadcast Sent At|Campaign Sent At|Sent At|Sent On)\s*(?::\s*(.*))?$', re.I)
+              lines = [line.strip() for line in body.splitlines() if line.strip()]
+              for index, line in enumerate(lines):
+                  match = label.fullmatch(line)
+                  if not match:
+                      continue
+                  value = (match.group(1) or '').strip()
+                  if not value and index + 1 < len(lines):
+                      value = lines[index + 1]
+                  # Require a clock time and an explicit timezone. A timezone-free
+                  # UI value cannot safely be assumed to be IST or UTC.
+                  if not re.search(r'\d{1,2}:\d{2}', value):
+                      continue
+                  tz_match = re.search(r'\s*(IST|UTC|GMT|Z|[+-]\d{2}:?\d{2})$', value, re.I)
+                  if not tz_match:
+                      continue
+                  zone = tz_match.group(1).upper()
+                  stamp = value[:tz_match.start()].strip().rstrip(',').strip()
+                  if zone == 'IST':
+                      tz = IST
+                  elif zone in ('UTC', 'GMT', 'Z'):
+                      tz = timezone.utc
+                  else:
+                      try:
+                          offset = zone if ':' in zone else zone[:3] + ':' + zone[3:]
+                          tz = datetime.fromisoformat('2000-01-01T00:00:00' + offset).tzinfo
+                      except ValueError:
+                          continue
+                  parsed = None
+                  try:
+                      parsed = datetime.fromisoformat(stamp)
+                  except ValueError:
+                      for fmt in (
+                          '%b %d, %Y %I:%M:%S %p', '%b %d, %Y %I:%M %p',
+                          '%B %d, %Y %I:%M:%S %p', '%B %d, %Y %I:%M %p',
+                          '%b %d, %Y, %I:%M:%S %p', '%b %d, %Y, %I:%M %p',
+                          '%b %d, %Y %H:%M:%S', '%b %d, %Y %H:%M',
+                          '%Y-%m-%d %I:%M:%S %p', '%Y-%m-%d %I:%M %p',
+                      ):
+                          try:
+                              parsed = datetime.strptime(stamp, fmt)
+                              break
+                          except ValueError:
+                              pass
+                  if parsed is not None:
+                      return parsed.replace(tzinfo=tz).astimezone(IST).strftime('%Y-%m-%d %I:%M:%S %p IST')
+              return ''
 
           def extract_names(body):
               lines = [line.strip() for line in body.splitlines() if line.strip()]
@@ -170,17 +221,20 @@ jobs:
                   'Campaign ID': campaign_id,
                   'Campaign Name': name,
                   'Date': date_from_body(body),
+                  'Broadcast Sent At (IST)': sent_time_from_body(body),
                   'Campaign Type': kind.group(1) if kind else 'BROADCAST',
                   **values,
                   'Cost per Message': (values['Actual Cost'] / values['Sent']) if values['Sent'] else 0.0,
                   'Estimated Cost': '',
                   'Last Updated': ist_now(),
               }
+              if not record['Broadcast Sent At (IST)']:
+                  print(f'No usable explicit sent timestamp for {name}; retaining any historical value.', flush=True)
               print(f"Fetched {name}: sent={record['Sent']}, delivered={record['Delivered']}, cost=INR {record['Actual Cost']}", flush=True)
               return record
 
           def existing_record(row):
-              padded = list(row[:15]) + [''] * max(0, 15 - len(row))
+              padded = list(row[:16]) + [''] * max(0, 16 - len(row))
               rec = dict(zip(HEADERS, padded))
               for field in ('Audience Size', 'Sent', 'Delivered', 'Read', 'Failed'):
                   rec[field] = count(rec[field])
@@ -198,6 +252,7 @@ jobs:
                   count(rec['Audience Size']), sent, delivered, read, count(rec['Failed']),
                   delivered / sent if sent else 0, read / delivered if delivered else 0,
                   rate, '', number(rec['Actual Cost']), rec['Last Updated'],
+                  rec.get('Broadcast Sent At (IST)', ''),
               ]
 
           def ensure_rows(ws, minimum):
@@ -270,6 +325,8 @@ jobs:
                   old = existing_by_id[cid]
                   if not rec['Date']:
                       rec['Date'] = old.get('Date', '')
+                  if not rec['Broadcast Sent At (IST)']:
+                      rec['Broadcast Sent At (IST)'] = old.get('Broadcast Sent At (IST)', '')
                   updated_count += 1
               else:
                   order.append(cid)
@@ -290,11 +347,14 @@ jobs:
               reverse=True,
           )
           data_rows = [output_row(rec) for rec in records]
+          if data_ws.col_count < 16:
+              data_ws.add_cols(16 - data_ws.col_count)
           ensure_rows(data_ws, len(data_rows) + 1)
-          update_values(data_ws, 'A1:O1', [HEADERS])
-          update_values(data_ws, f'A2:O{len(data_rows)+1}', data_rows)
+          update_values(data_ws, 'A1:P1', [HEADERS])
+          update_values(data_ws, f'A2:P{len(data_rows)+1}', data_rows)
           if len(existing_rows) > len(data_rows) + 1:
-              data_ws.batch_clear([f'A{len(data_rows)+2}:O{len(existing_rows)}'])
+              data_ws.batch_clear([f'A{len(data_rows)+2}:P{len(existing_rows)}'])
+          data_ws.format(f'P2:P{len(data_rows)+1}', {'numberFormat': {'type': 'TEXT'}})
           data_ws.format(f'O2:O{len(data_rows)+1}', {'numberFormat': {'type': 'TEXT'}})
           data_ws.format(f'E2:I{len(data_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
           data_ws.format(f'J2:K{len(data_rows)+1}', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
@@ -304,7 +364,7 @@ jobs:
           summary_header = [
               'Campaign ID', 'Campaign Name', 'Date', 'Audience', 'Sent', 'Delivered',
               'Read', 'Failed', 'Actual Cost (INR)', 'Cost per Sent',
-              'Cost per Delivered', 'Last Updated',
+              'Cost per Delivered', 'Last Updated', 'Broadcast Sent At (IST)',
           ]
           summary_rows = []
           for rec in records:
@@ -316,12 +376,16 @@ jobs:
                   count(rec['Audience Size']), sent, delivered, count(rec['Read']),
                   count(rec['Failed']), cost, cost / sent if sent else 0,
                   cost / delivered if delivered else 0, rec['Last Updated'],
+                  rec.get('Broadcast Sent At (IST)', ''),
               ])
           previous_summary = len(summary_ws.get_all_values())
+          if summary_ws.col_count < 13:
+              summary_ws.add_cols(13 - summary_ws.col_count)
           ensure_rows(summary_ws, len(summary_rows) + 1)
-          update_values(summary_ws, f'A1:L{len(summary_rows)+1}', [summary_header] + summary_rows)
+          update_values(summary_ws, f'A1:M{len(summary_rows)+1}', [summary_header] + summary_rows)
           if previous_summary > len(summary_rows) + 1:
-              summary_ws.batch_clear([f'A{len(summary_rows)+2}:L{previous_summary}'])
+              summary_ws.batch_clear([f'A{len(summary_rows)+2}:M{previous_summary}'])
+          summary_ws.format(f'M2:M{len(summary_rows)+1}', {'numberFormat': {'type': 'TEXT'}})
           summary_ws.format(f'L2:L{len(summary_rows)+1}', {'numberFormat': {'type': 'TEXT'}})
           summary_ws.format(f'D2:H{len(summary_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
           summary_ws.format(f'I2:K{len(summary_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0.000'}})
@@ -347,25 +411,28 @@ jobs:
               ['Last Sync (IST)', sync_time],
               ['Campaigns Added This Sync', new_count, f'{new_count} new campaign(s) added; {updated_count} existing campaign(s) refreshed'],
               ['CAMPAIGN PERFORMANCE'],
-              ['Campaign Name', 'Date', 'Sent', 'Delivered', 'Read', 'Failed', 'Delivery Rate', 'Read Rate', 'Actual Cost (INR)'],
+              ['Campaign Name', 'Date', 'Sent', 'Delivered', 'Read', 'Failed', 'Delivery Rate', 'Read Rate', 'Actual Cost (INR)', 'Broadcast Sent At (IST)'],
           ]
           for rec in records:
               sent, delivered, read = count(rec['Sent']), count(rec['Delivered']), count(rec['Read'])
               dashboard.append([
                   rec['Campaign Name'], rec['Date'], sent, delivered, read, count(rec['Failed']),
                   delivered / sent if sent else 0, read / delivered if delivered else 0,
-                  number(rec['Actual Cost']),
+                  number(rec['Actual Cost']), rec.get('Broadcast Sent At (IST)', ''),
               ])
           previous_dashboard = len(dashboard_ws.get_all_values())
+          if dashboard_ws.col_count < 10:
+              dashboard_ws.add_cols(10 - dashboard_ws.col_count)
           ensure_rows(dashboard_ws, len(dashboard))
           dashboard_ws.batch_clear([f'A1:O{max(previous_dashboard, len(dashboard))}'])
           dashboard[12][1] = ist_now()  # Actual dashboard write time in IST
-          update_values(dashboard_ws, f'A1:I{len(dashboard)}', dashboard)
+          update_values(dashboard_ws, f'A1:J{len(dashboard)}', dashboard)
           dashboard_ws.format('B13', {'numberFormat': {'type': 'TEXT'}})
           dashboard_ws.format('B2:B7', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
           dashboard_ws.format('B10:B11', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
           dashboard_ws.format('B8:B9', {'numberFormat': {'type': 'CURRENCY', 'pattern': '₹#,##0.00'}})
           if records:
+              dashboard_ws.format(f'J17:J{16+len(records)}', {'numberFormat': {'type': 'TEXT'}})
               dashboard_ws.format(f'C17:F{16+len(records)}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
               dashboard_ws.format(f'G17:H{16+len(records)}', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
               dashboard_ws.format(f'I17:I{16+len(records)}', {'numberFormat': {'type': 'CURRENCY', 'pattern': '₹#,##0.00'}})
