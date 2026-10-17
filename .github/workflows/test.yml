@@ -43,7 +43,7 @@ jobs:
           from datetime import timedelta
           from datetime import datetime, timezone
           from zoneinfo import ZoneInfo
-          from playwright.sync_api import sync_playwright
+          from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
           import gspread
           from google.oauth2.service_account import Credentials
 
@@ -349,9 +349,42 @@ jobs:
               return names
 
           def wait_for_list(page):
-              page.goto(LIST_URL, wait_until='domcontentloaded', timeout=60000)
-              page.get_by_text('Rows per page:', exact=False).first.wait_for(timeout=30000)
-              page.wait_for_timeout(1400)
+              # A footer label is not a reliable readiness signal. Detect actual
+              # campaign rows or an explicit empty state, and distinguish login.
+              last_url = ''
+              for attempt in range(1, 3):
+                  try:
+                      try:
+                          page.goto(LIST_URL, wait_until='domcontentloaded', timeout=30000)
+                      except PlaywrightTimeoutError:
+                          # The SPA may still be usable after a navigation timeout.
+                          print(f'Campaign navigation slow on attempt {attempt}; checking rendered page.', flush=True)
+                      state = page.wait_for_function(r"""() => {
+                          const text = (document.body?.innerText || '').trim();
+                          if (/\/(?:login|signup)(?:[/?#]|$)/i.test(location.pathname) ||
+                              (document.querySelector('input[type="password"]') && /log\s*in|sign\s*in/i.test(text))) {
+                              return 'login';
+                          }
+                          const campaignRoute = /\/campaigns\/all(?:[/?#]|$)/.test(location.pathname);
+                          const rows = /\b(?:BROADCAST|API)\b/.test(text) &&
+                              /[A-Za-z]{3}\s+\d{1,2},\s+\d{4}/.test(text);
+                          const empty = /no (?:campaigns|broadcasts|records|data)(?: (?:found|available|to display))?/i.test(text);
+                          return campaignRoute && (rows || empty) ? 'ready' : false;
+                      }""", timeout=20000).json_value()
+                      if state == 'login':
+                          raise RuntimeError(
+                              'AISENSY_SESSION is expired or not authenticated. Sign in to AiSensy and replace '
+                              'the GitHub AISENSY_SESSION secret with a fresh Playwright storage-state JSON. '
+                              'No broadcast data was changed.')
+                      if state == 'ready':
+                          page.wait_for_timeout(500)
+                          return
+                  except PlaywrightTimeoutError:
+                      last_url = page.url.split('?')[0].split('#')[0]
+                      print(f'Campaign list not ready on attempt {attempt}/2; location: {last_url}', flush=True)
+              raise RuntimeError(
+                  f'AiSensy campaign rows did not load after two attempts. Last location: {last_url}. '
+                  'Check session access or an AiSensy page change. No broadcast data was changed.')
 
           def campaign_list_records(payloads):
               result = {}
@@ -408,6 +441,7 @@ jobs:
               seen_pages = set()
               with campaign_responses(list_page) as payloads:
                   wait_for_list(list_page)
+                  list_available = True
                   for page_number in range(1, MAX_DISCOVERY_PAGES + 1):
                       body = list_page.locator('body').inner_text()
                       if body in seen_pages:
