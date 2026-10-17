@@ -39,6 +39,9 @@ jobs:
           import os
           import re
           import sys
+          import time
+          from pathlib import Path
+          from urllib.parse import urlsplit
           from contextlib import contextmanager
           from datetime import timedelta
           from datetime import datetime, timezone
@@ -48,7 +51,7 @@ jobs:
           from google.oauth2.service_account import Credentials
 
           PROJECT_ID = '6589906ef69fc70b424e0e43'
-          LIST_URL = f'https://www.app.aisensy.com/projects/{PROJECT_ID}/campaigns/all'
+          LIST_URL = f'https://app.aisensy.com/projects/{PROJECT_ID}/campaigns/all'
           MAX_CAMPAIGNS = 5
           METRICS_BATCH_SIZE = 5
           MAX_DISCOVERY_PAGES = 3
@@ -348,43 +351,77 @@ jobs:
                       names.append(candidate)
               return names
 
-          def wait_for_list(page):
-              # A footer label is not a reliable readiness signal. Detect actual
-              # campaign rows or an explicit empty state, and distinguish login.
-              last_url = ''
-              for attempt in range(1, 3):
-                  try:
+          def save_list_diagnostics(page, failures):
+              folder = Path('aisensy-debug')
+              folder.mkdir(exist_ok=True)
+              info = {'url': page.url.split('?')[0], 'network': failures[-15:]}
+              try:
+                  info['page'] = page.evaluate("""() => ({
+                      title: document.title,
+                      passwordForm: !!document.querySelector('input[type="password"]'),
+                      tableCount: document.querySelectorAll('table,[role="table"],[role="grid"]').length,
+                      bodyCharacters: (document.body?.innerText || '').length,
+                      headings: [...document.querySelectorAll('h1,h2,h3,[role="heading"]')].map(el=>el.innerText).slice(0,12),
+                  })""")
+                  page.screenshot(path=str(folder / 'campaign-list.png'), full_page=False,
+                                  mask=[page.locator('input')], timeout=10000)
+              except Exception as exc:
+                  info['diagnostic_error'] = type(exc).__name__
+              (folder / 'loading-report.json').write_text(json.dumps(info, indent=2))
+              print('Saved campaign-list screenshot and loading report in the aisensy-debug artifact. No cookies or tokens are included.', flush=True)
+
+          def wait_for_list(page, payloads=None):
+              failures = []
+              def failed(request):
+                  parsed = urlsplit(request.url)
+                  failures.append({'url': parsed.scheme + '://' + parsed.netloc + parsed.path,
+                                   'error': str(request.failure or 'request failed')})
+              def response_status(response):
+                  if response.status >= 400:
+                      parsed = urlsplit(response.url)
+                      failures.append({'url': parsed.scheme + '://' + parsed.netloc + parsed.path,
+                                       'status': response.status})
+              page.on('requestfailed', failed)
+              page.on('response', response_status)
+              try:
+                  for attempt in range(1, 3):
                       try:
                           page.goto(LIST_URL, wait_until='domcontentloaded', timeout=30000)
                       except PlaywrightTimeoutError:
-                          # The SPA may still be usable after a navigation timeout.
-                          print(f'Campaign navigation slow on attempt {attempt}; checking rendered page.', flush=True)
-                      state = page.wait_for_function(r"""() => {
-                          const text = (document.body?.innerText || '').trim();
-                          if (/\/(?:login|signup)(?:[/?#]|$)/i.test(location.pathname) ||
-                              (document.querySelector('input[type="password"]') && /log\s*in|sign\s*in/i.test(text))) {
-                              return 'login';
-                          }
-                          const campaignRoute = /\/campaigns\/all(?:[/?#]|$)/.test(location.pathname);
-                          const rows = /\b(?:BROADCAST|API)\b/.test(text) &&
-                              /[A-Za-z]{3}\s+\d{1,2},\s+\d{4}/.test(text);
-                          const empty = /no (?:campaigns|broadcasts|records|data)(?: (?:found|available|to display))?/i.test(text);
-                          return campaignRoute && (rows || empty) ? 'ready' : false;
-                      }""", timeout=20000).json_value()
-                      if state == 'login':
-                          raise RuntimeError(
-                              'AISENSY_SESSION is expired or not authenticated. Sign in to AiSensy and replace '
-                              'the GitHub AISENSY_SESSION secret with a fresh Playwright storage-state JSON. '
-                              'No broadcast data was changed.')
-                      if state == 'ready':
+                          print(f'Navigation slow on attempt {attempt}; checking page and campaign responses.', flush=True)
+                      deadline = time.monotonic() + 25
+                      while time.monotonic() < deadline:
+                          try:
+                              state = page.evaluate(r"""() => {
+                                  const text = (document.body?.innerText || '').trim();
+                                  if (/\/(?:login|signup)(?:[/?#]|$)/i.test(location.pathname) ||
+                                      (document.querySelector('input[type="password"]') && /log\s*in|sign\s*in/i.test(text))) return 'login';
+                                  if (!/\/campaigns\/all(?:[/?#]|$)/.test(location.pathname)) return false;
+                                  if (/no (?:campaigns|broadcasts|records|data)(?: (?:found|available|to display))?/i.test(text)) return 'ready';
+                                  // Do not assume an English month or a footer caption.
+                                  const lines = text.split('\n').map(line=>line.trim()).filter(Boolean);
+                                  const typedRow = lines.some((line,index)=>
+                                      line === 'BROADCAST' && index > 0 &&
+                                      lines.slice(index+1,index+9).some(value=>/^(SENT|LIVE|PAUSED|STOPPED|DRAFT|SCHEDULED)$/i.test(value)));
+                                  const gridRows = [...document.querySelectorAll('table tbody tr,[role="rowgroup"] [role="row"]')]
+                                      .some(row=>/BROADCAST/i.test(row.innerText || ''));
+                                  return typedRow || gridRows ? 'ready' : false;
+                              }""")
+                              if state == 'login':
+                                  save_list_diagnostics(page, failures)
+                                  raise RuntimeError('AiSensy redirected to login. Refresh the AISENSY_SESSION GitHub secret; the stored session is not authenticated. No broadcast data was changed.')
+                              if state == 'ready' or (payloads is not None and campaign_list_records(payloads)):
+                                  page.wait_for_timeout(500)
+                                  return
+                          except PlaywrightTimeoutError:
+                              pass
                           page.wait_for_timeout(500)
-                          return
-                  except PlaywrightTimeoutError:
-                      last_url = page.url.split('?')[0].split('#')[0]
-                      print(f'Campaign list not ready on attempt {attempt}/2; location: {last_url}', flush=True)
-              raise RuntimeError(
-                  f'AiSensy campaign rows did not load after two attempts. Last location: {last_url}. '
-                  'Check session access or an AiSensy page change. No broadcast data was changed.')
+                      print(f'Campaign list not ready on attempt {attempt}/2; location: {page.url.split("?")[0]}', flush=True)
+                  save_list_diagnostics(page, failures)
+                  raise RuntimeError('AiSensy campaign data did not become available. Download the aisensy-debug artifact from this Actions run and share campaign-list.png plus loading-report.json. No broadcast data was changed.')
+              finally:
+                  page.remove_listener('requestfailed', failed)
+                  page.remove_listener('response', response_status)
 
           def campaign_list_records(payloads):
               result = {}
@@ -440,7 +477,7 @@ jobs:
               fallback_rows = []
               seen_pages = set()
               with campaign_responses(list_page) as payloads:
-                  wait_for_list(list_page)
+                  wait_for_list(list_page, payloads)
                   list_available = True
                   for page_number in range(1, MAX_DISCOVERY_PAGES + 1):
                       body = list_page.locator('body').inner_text()
@@ -933,6 +970,14 @@ jobs:
           if not google_json:
               raise RuntimeError('Missing GOOGLE_SERVICE_ACCOUNT_JSON secret')
           session = json.loads(session_json)
+          origins = session.get('origins', [])
+          if not any(item.get('origin') == 'https://app.aisensy.com' for item in origins):
+              legacy = next((item for item in origins if item.get('origin') == 'https://www.app.aisensy.com'), None)
+              if legacy:
+                  origins.append({'origin': 'https://app.aisensy.com', 'localStorage': legacy.get('localStorage', [])})
+                  session['origins'] = origins
+                  print('Applied legacy AiSensy local-storage state to the canonical app origin.', flush=True)
+
           credentials = Credentials.from_service_account_info(
               json.loads(google_json), scopes=['https://www.googleapis.com/auth/spreadsheets'])
           spreadsheet = gspread.authorize(credentials).open_by_key(SHEET_ID)
@@ -1464,3 +1509,12 @@ jobs:
           )
           print('Recorded failure status in Dashboard; last successful sync timestamp retained.')
           PY
+
+      - name: Upload AiSensy loading diagnostics on failure
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: aisensy-debug
+          path: aisensy-debug/
+          if-no-files-found: ignore
+          retention-days: 3
