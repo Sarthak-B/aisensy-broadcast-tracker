@@ -970,13 +970,22 @@ jobs:
           if not google_json:
               raise RuntimeError('Missing GOOGLE_SERVICE_ACCOUNT_JSON secret')
           session = json.loads(session_json)
-          origins = session.get('origins', [])
-          if not any(item.get('origin') == 'https://app.aisensy.com' for item in origins):
-              legacy = next((item for item in origins if item.get('origin') == 'https://www.app.aisensy.com'), None)
-              if legacy:
-                  origins.append({'origin': 'https://app.aisensy.com', 'localStorage': legacy.get('localStorage', [])})
-                  session['origins'] = origins
-                  print('Applied legacy AiSensy local-storage state to the canonical app origin.', flush=True)
+          if not isinstance(session, dict) or not isinstance(session.get('cookies', []), list) or not isinstance(session.get('origins', []), list):
+              raise RuntimeError('AISENSY_SESSION must contain Playwright storage-state JSON. Refresh it with the login script.')
+          # AiSensy redirects between these two origins. Restore missing origin storage
+          # before navigation; never overwrite storage already captured for an origin.
+          origins = session.setdefault('origins', [])
+          app_origins = ('https://app.aisensy.com', 'https://www.app.aisensy.com')
+          saved_origins = {item.get('origin'): item for item in origins if isinstance(item, dict)}
+          for target in app_origins:
+              if target in saved_origins:
+                  continue
+              source = next((saved_origins[origin] for origin in app_origins if origin in saved_origins), None)
+              if source is not None:
+                  restored = json.loads(json.dumps(source))
+                  restored['origin'] = target
+                  origins.append(restored)
+                  print(f'Restored saved AiSensy browser storage for {target}.', flush=True)
 
           credentials = Credentials.from_service_account_info(
               json.loads(google_json), scopes=['https://www.googleapis.com/auth/spreadsheets'])
