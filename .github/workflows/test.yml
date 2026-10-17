@@ -529,6 +529,8 @@ jobs:
                       except Exception as exc:
                           print(f'WARNING: New sent broadcast {name} could not be captured; retry next run: {exc}', flush=True)
               print(f'Latest sent broadcasts checked; new records fetched: {len(fetched)}.', flush=True)
+              for record in fetched:
+                  print('New broadcast captured: ' + record['Campaign Name'] + ' | ID: ' + record['Campaign ID'], flush=True)
               return fetched, list_available
 
           def content_from_campaign(body, payloads, campaign_id):
@@ -1052,10 +1054,6 @@ jobs:
 
           if not list_available:
               raise RuntimeError('AiSensy campaign list returned no names. Session may have expired or the page changed; spreadsheet was not modified.')
-          if not fetched:
-              persist_metric_cursor(next_metric_cursor)
-              print('No updates saved: 0 new added; 0 existing updated. See warnings for any failed checks.', flush=True)
-              sys.exit(0)
           sync_time = ist_now()
           new_ids = {rec['Campaign ID'] for rec in fetched if rec['Campaign ID'] not in existing_by_id}
 
@@ -1063,8 +1061,6 @@ jobs:
           # Retain historical campaigns that were not fetched this time.
           if new_ids:
               print(f'{len(new_ids)} new broadcast(s) found; refreshing fetched campaign metrics.', flush=True)
-          else:
-              print('Nothing was updated.', flush=True)
 
           new_count = 0
           updated_count = 0
@@ -1097,7 +1093,21 @@ jobs:
                   new_count += 1
               existing_by_id[cid] = rec
 
-          if not new_count and not updated_count:
+          # Use campaign chronology for every table, including previously saved IDs.
+          # Stable sorting keeps equal/unknown dates in their existing relative order.
+          records = sorted((existing_by_id[cid] for cid in order),
+                           key=lambda rec: chronological_time(date_with_time(rec)), reverse=True)
+          desired_ids = [rec['Campaign ID'] for rec in records]
+          order_changed = desired_ids != order
+          # Repair a secondary campaign table even if Broadcast_Data is already sorted.
+          for managed_ws in (summary_ws, analysis_ws, contents_ws):
+              if managed_ws is not None:
+                  saved_ids = [str(value).strip() for value in managed_ws.col_values(1)[1:] if str(value).strip()]
+                  if saved_ids != desired_ids:
+                      order_changed = True
+          if order_changed:
+              print('Repairing campaign table order: newest campaign date first.', flush=True)
+          if not new_count and not updated_count and not order_changed:
               persist_metric_cursor(next_metric_cursor)
               print('Nothing was updated: 0 new added; 0 existing updated. Sheets left unchanged.', flush=True)
               sys.exit(0)
@@ -1105,10 +1115,6 @@ jobs:
           if updated_campaign_names:
               print('Updated existing broadcasts: ' + ', '.join(updated_campaign_names), flush=True)
 
-          # Add new broadcasts above existing rows. Never promote older history.
-          latest_records = sorted((existing_by_id[cid] for cid in new_ids),
-                                  key=lambda rec: (chronological_time(date_with_time(rec)), rec['Campaign ID']), reverse=True)
-          records = latest_records + [existing_by_id[cid] for cid in order if cid not in new_ids]
           missing_source_ids = set(source_times) - set(existing_by_id)
           if missing_source_ids:
               raise RuntimeError('Source times include campaigns missing from Broadcast_Data; no cleanup was performed.')
