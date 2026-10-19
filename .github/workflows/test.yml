@@ -361,6 +361,9 @@ jobs:
                       passwordForm: !!document.querySelector('input[type="password"]'),
                       tableCount: document.querySelectorAll('table,[role="table"],[role="grid"]').length,
                       bodyCharacters: (document.body?.innerText || '').length,
+                      pagination: ((document.body?.innerText || '').match(/\d+\s*[-–]\s*\d+\s+of\s+[\d,]+/i) || [null])[0],
+                      campaignSearchPresent: !!document.querySelector('input[placeholder*="campaign" i]'),
+                      campaignSearchHasValue: !!document.querySelector('input[placeholder*="campaign" i]')?.value,
                       headings: [...document.querySelectorAll('h1,h2,h3,[role="heading"]')].map(el=>el.innerText).slice(0,12),
                       campaignStructure: [...document.querySelectorAll('div,span,p,td')]
                           .filter(el => el.getClientRects().length && el.textContent.trim() === 'BROADCAST')
@@ -404,7 +407,12 @@ jobs:
                           page.goto(LIST_URL, wait_until='domcontentloaded', timeout=30000)
                       except PlaywrightTimeoutError:
                           print(f'Navigation slow on attempt {attempt}; checking page and campaign responses.', flush=True)
-                      deadline = time.monotonic() + 25
+                      # A persisted campaign-name search can hide all current rows.
+                      search = page.locator('input[placeholder*="campaign" i]')
+                      if search.count() == 1 and search.is_visible() and search.input_value():
+                          search.fill('')
+                          print('Cleared saved campaign-name search filter.', flush=True)
+                      deadline = time.monotonic() + 40
                       while time.monotonic() < deadline:
                           try:
                               state = page.evaluate(r"""() => {
@@ -412,7 +420,8 @@ jobs:
                                   if (/\/(?:login|signup)(?:[/?#]|$)/i.test(location.pathname) ||
                                       (document.querySelector('input[type="password"]') && /log\s*in|sign\s*in/i.test(text))) return 'login';
                                   if (!/\/campaigns\/all(?:[/?#]|$)/.test(location.pathname)) return false;
-                                  if (/no (?:campaigns|broadcasts|records|data)(?: (?:found|available|to display))?/i.test(text)) return 'ready';
+                                  // Empty-list placeholders can appear before the API completes.
+                                  // Only actual campaign rows establish readiness.
                                   // Do not assume an English month or a footer caption.
                                   const lines = text.split('\n').map(line=>line.trim()).filter(Boolean);
                                   const typedRow = lines.some((line,index)=>
@@ -433,7 +442,7 @@ jobs:
                           page.wait_for_timeout(500)
                       print(f'Campaign list not ready on attempt {attempt}/2; location: {page.url.split("?")[0]}', flush=True)
                   save_list_diagnostics(page, failures)
-                  raise RuntimeError('AiSensy campaign data did not become available. Download the aisensy-debug artifact from this Actions run and share campaign-list.png plus loading-report.json. No broadcast data was changed.')
+                  raise RuntimeError('AiSensy did not supply campaign rows after two attempts. The empty/loading list was not treated as a successful sync. See AISENSY DIAGNOSTIC REPORT and the artifact. No broadcast data was changed.')
               finally:
                   page.remove_listener('requestfailed', failed)
                   page.remove_listener('response', response_status)
@@ -511,7 +520,12 @@ jobs:
 
           def discover_new_broadcasts(list_page, detail_page, saved):
               wait_for_list(list_page)
-              rows = visible_sent_rows(list_page)
+              rows = []
+              for _ in range(20):
+                  rows = visible_sent_rows(list_page)
+                  if rows:
+                      break
+                  list_page.wait_for_timeout(500)
               if not rows:
                   save_list_diagnostics(list_page, [])
                   raise RuntimeError('No sent broadcast rows could be identified on the visible campaign list. See aisensy-debug; this is not a successful zero-new run.')
