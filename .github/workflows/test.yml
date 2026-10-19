@@ -48,6 +48,31 @@ jobs:
           from zoneinfo import ZoneInfo
           from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
           import gspread
+          import time
+          from gspread.http_client import HTTPClient
+          from gspread.exceptions import APIError
+
+          class QuotaSafeHTTPClient(HTTPClient):
+              """Space writes and retry only explicit quota rejections."""
+              def request(self, method, endpoint, *args, **kwargs):
+                  write = method.lower() not in ('get', 'head', 'options')
+                  for attempt in range(5):
+                      if write:
+                          remaining = getattr(self, '_next_write_at', 0) - time.monotonic()
+                          if remaining > 0:
+                              time.sleep(remaining)
+                          self._next_write_at = time.monotonic() + 1.25
+                      try:
+                          return super().request(method, endpoint, *args, **kwargs)
+                      except APIError as exc:
+                          # Retrying ambiguous server/network failures could duplicate row moves
+                          # or chart creation. Only 429 confirms this request was rejected.
+                          if exc.response.status_code != 429 or attempt == 4:
+                              raise
+                          delay = min(60, 15 * (2 ** attempt))
+                          print(f'Google Sheets quota reached; retrying the rejected request in {delay}s ({attempt+1}/4).', flush=True)
+                          time.sleep(delay)
+
           from google.oauth2.service_account import Credentials
 
           PROJECT_ID = '6589906ef69fc70b424e0e43'
@@ -1030,7 +1055,7 @@ jobs:
 
           credentials = Credentials.from_service_account_info(
               json.loads(google_json), scopes=['https://www.googleapis.com/auth/spreadsheets'])
-          spreadsheet = gspread.authorize(credentials).open_by_key(SHEET_ID)
+          spreadsheet = gspread.authorize(credentials, http_client=QuotaSafeHTTPClient).open_by_key(SHEET_ID)
           data_ws = spreadsheet.worksheet('Broadcast_Data')
           summary_ws = spreadsheet.worksheet('Cost Summary')
           dashboard_ws = spreadsheet.worksheet('Dashboard')
@@ -1550,6 +1575,31 @@ jobs:
           from datetime import datetime
           from zoneinfo import ZoneInfo
           import gspread
+          import time
+          from gspread.http_client import HTTPClient
+          from gspread.exceptions import APIError
+
+          class QuotaSafeHTTPClient(HTTPClient):
+              """Space writes and retry only explicit quota rejections."""
+              def request(self, method, endpoint, *args, **kwargs):
+                  write = method.lower() not in ('get', 'head', 'options')
+                  for attempt in range(5):
+                      if write:
+                          remaining = getattr(self, '_next_write_at', 0) - time.monotonic()
+                          if remaining > 0:
+                              time.sleep(remaining)
+                          self._next_write_at = time.monotonic() + 1.25
+                      try:
+                          return super().request(method, endpoint, *args, **kwargs)
+                      except APIError as exc:
+                          # Retrying ambiguous server/network failures could duplicate row moves
+                          # or chart creation. Only 429 confirms this request was rejected.
+                          if exc.response.status_code != 429 or attempt == 4:
+                              raise
+                          delay = min(60, 15 * (2 ** attempt))
+                          print(f'Google Sheets quota reached; retrying the rejected request in {delay}s ({attempt+1}/4).', flush=True)
+                          time.sleep(delay)
+
           from google.oauth2.service_account import Credentials
 
           raw = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '').strip() or os.environ.get('GOOGLE_CREDENTIALS', '').strip()
@@ -1561,7 +1611,7 @@ jobs:
               scopes=['https://www.googleapis.com/auth/spreadsheets']
           )
           sheet_id = os.environ.get('GOOGLE_SHEET_ID', '').strip() or '1jXnQPQngi-FbEBBHC0tvaOTXxmtE5_miv6Mq0rTbmLQ'
-          ws = gspread.authorize(creds).open_by_key(sheet_id).worksheet('Dashboard')
+          ws = gspread.authorize(creds, http_client=QuotaSafeHTTPClient).open_by_key(sheet_id).worksheet('Dashboard')
           timestamp = datetime.now(ZoneInfo('Asia/Kolkata')).strftime('%Y-%m-%d %I:%M:%S %p IST')
 
           # Do not overwrite Last Sync: it records the last successful sync.
