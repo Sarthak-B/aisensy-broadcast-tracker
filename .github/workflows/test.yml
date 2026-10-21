@@ -146,15 +146,48 @@ jobs:
                   walk(payload)
               return next(iter(values)) if len(values) == 1 else None
 
-          def read_saved_clicks(ws):
+          def replied_count(body, payloads, campaign_id):
+              # Same evidence rules as Clicked: the page card first, then only a
+              # campaign-level response object with this exact campaign ID.
+              for label in ('Replied', 'Replies'):
+                  direct = metric(body, label)
+                  if direct is not None:
+                      return direct
+              match = re.search(r'(?i)[\d.]+\s*%\s*\(\s*([\d,]+)\s*\)\s*(?:PRO\s*)?Repl(?:ied|ies)\b', body)
+              if match:
+                  return count(match.group(1))
+              values = set()
+              def walk(value):
+                  if isinstance(value, list):
+                      for item in value:
+                          walk(item)
+                  elif isinstance(value, dict):
+                      fields = {re.sub(r'[^a-z0-9]', '', str(k).lower()): v for k, v in value.items()}
+                      identities = [str(fields[k]) for k in ('id', 'campaignid', 'broadcastid') if k in fields]
+                      if campaign_id in identities and not any(k in fields for k in ('messageid', 'contactid', 'recipientid')):
+                          for field in ('replied', 'repliedcount', 'replycount', 'totalreplied', 'replies', 'totalreplies'):
+                              raw = fields.get(field)
+                              if raw is not None and not isinstance(raw, bool) and re.fullmatch(r'\d+(?:\.0+)?', str(raw)):
+                                  values.add(int(float(raw)))
+                      for item in value.values():
+                          if isinstance(item, (dict, list)):
+                              walk(item)
+              for payload in payloads:
+                  walk(payload)
+              return next(iter(values)) if len(values) == 1 else None
+
+          def read_saved_metric(ws, header):
               if ws is None:
                   return {}
               rows = ws.get_all_values(value_render_option='UNFORMATTED_VALUE')
-              if not rows or 'Clicked' not in rows[0]:
+              if not rows or header not in rows[0]:
                   return {}
-              col = rows[0].index('Clicked')
+              col = rows[0].index(header)
               return {str(row[0]).strip(): count(row[col]) for row in rows[1:]
                       if row and len(row) > col and row[col] != ''}
+
+          def read_saved_clicks(ws):
+              return read_saved_metric(ws, 'Clicked')
 
           def failed_count(body):
               direct = metric(body, 'Failed')
@@ -894,6 +927,7 @@ jobs:
                       'Campaign Type': kind.group(1) if kind else 'BROADCAST',
                       **values,
                       'Clicked': clicked_count(body, payloads, campaign_id),
+                      'Replied': replied_count(body, payloads, campaign_id),
                       'Cost per Message': (values['Actual Cost'] / values['Sent']) if values['Sent'] else 0.0,
                       'Estimated Cost': '',
                       'Last Updated': ist_now(),
@@ -903,7 +937,9 @@ jobs:
                   }
                   if not record['Broadcast Sent At (IST)']:
                       print(f'No usable explicit sent timestamp for {name}; retaining any historical value.', flush=True)
-                  print(f"Fetched {name}: sent={record['Sent']}, delivered={record['Delivered']}, cost=INR {record['Actual Cost']}", flush=True)
+                  if record['Replied'] is None:
+                      print(f'Replied count not shown for {name}; retaining any saved value.', flush=True)
+                  print(f"Fetched {name}: sent={record['Sent']}, delivered={record['Delivered']}, clicked={record['Clicked']}, replied={record['Replied']}, cost=INR {record['Actual Cost']}", flush=True)
                   return record
 
           def existing_record(row):
@@ -1082,6 +1118,7 @@ jobs:
           analysis_ws = sheets_by_title.get('Broadcast Analysis')
           source_times = read_analysis_times(analysis_ws) if analysis_ws else {}
           saved_clicks = read_saved_clicks(analysis_ws)
+          saved_replies = read_saved_metric(analysis_ws, 'Replied')
           contents_ws = sheets_by_title.get('Broadcast Contents')
           contents_by_id = {}
           if contents_ws:
@@ -1103,6 +1140,7 @@ jobs:
               rec = existing_record(row)
               cid = rec['Campaign ID']
               rec['Clicked'] = saved_clicks.get(cid)
+              rec['Replied'] = saved_replies.get(cid)
               if not rec['Broadcast Sent At (IST)']:
                   rec['Broadcast Sent At (IST)'] = source_times.get(cid, '')
               if cid not in existing_by_id:
@@ -1155,7 +1193,9 @@ jobs:
                       rec['Broadcast Sent At (IST)'] = rec.get('Displayed Campaign Time (IST)', '')
                   if rec.get('Clicked') is None:
                       rec['Clicked'] = old.get('Clicked')
-                  tracked_fields = ('Campaign Name', 'Campaign Type', 'Audience Size', 'Sent', 'Delivered', 'Read', 'Failed', 'Actual Cost', 'Broadcast Sent At (IST)', 'Clicked')
+                  if rec.get('Replied') is None:
+                      rec['Replied'] = old.get('Replied')
+                  tracked_fields = ('Campaign Name', 'Campaign Type', 'Audience Size', 'Sent', 'Delivered', 'Read', 'Failed', 'Actual Cost', 'Broadcast Sent At (IST)', 'Clicked', 'Replied')
                   changed = date_with_time(rec) != date_with_time(old) or any(rec.get(field, '') != old.get(field, '') for field in tracked_fields)
                   if changed:
                       updated_count += 1
@@ -1296,6 +1336,7 @@ jobs:
               'Message Type', 'Content Angle', 'Delivery Rate', 'Read Rate',
               'Cost per Read', 'Data Status', 'Ranked', 'Data Check',
               'Clicked', 'Click Rate (Clicked / Delivered)',
+              'Replied', 'Reply Rate (Replied / Delivered)',
           ]
           analysis_rows = []
           for rec in records:
@@ -1383,11 +1424,13 @@ jobs:
                   '; '.join(issues),
                   rec.get('Clicked') if rec.get('Clicked') is not None else '',
                   rec['Clicked'] / delivered if rec.get('Clicked') is not None and delivered else '',
+                  rec.get('Replied') if rec.get('Replied') is not None else '',
+                  rec['Replied'] / delivered if rec.get('Replied') is not None and delivered else '',
               ])
           if analysis_ws.col_count < len(analysis_headers):
               analysis_ws.add_cols(len(analysis_headers) - analysis_ws.col_count)
           ensure_rows(analysis_ws, len(analysis_rows) + 1)
-          upsert_table(analysis_ws, analysis_headers, analysis_rows, 'AA')
+          upsert_table(analysis_ws, analysis_headers, analysis_rows, 'AC')
           spreadsheet.batch_update({'requests': [{'setDataValidation': {'range': {'sheetId': analysis_ws.id}, 'rule': None}}]})
           analysis_ws.freeze(rows=1)
           analysis_ws.format(f'C2:G{len(analysis_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
@@ -1398,6 +1441,8 @@ jobs:
               analysis_ws.format(f'{col}2:{col}{len(analysis_rows)+1}', {'numberFormat': {'type': 'TEXT'}})
           analysis_ws.format(f'Z2:Z{len(analysis_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
           analysis_ws.format(f'AA2:AA{len(analysis_rows)+1}', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
+          analysis_ws.format(f'AB2:AB{len(analysis_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}})
+          analysis_ws.format(f'AC2:AC{len(analysis_rows)+1}', {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}})
           analysis_ws.format(f'L2:L{len(analysis_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '0'}})
           analysis_ws.format(f'P2:P{len(analysis_rows)+1}', {'numberFormat': {'type': 'NUMBER', 'pattern': '0.00'}})
 
