@@ -160,9 +160,17 @@ jobs:
               direct = metric(body, 'Failed')
               if direct is not None:
                   return direct
-              match = re.search(r'(?i)[\d.]+\s*%\s*\(\s*([\d,]+)\s*\)\s*Failed\b', body)
+              # "12.5% (34) Failed" style
+              match = re.search(r'(?i)[\d.]+\s*%\s*\(\s*([\d,]+)\s*\)\s*(?:PRO\s*)?Failed\b', body)
               if match:
                   return count(match.group(1))
+              # "Failed Messages / Failed Count / Failed:" followed by a number
+              match = re.search(r'(?im)^\s*Failed(?:\s+Messages|\s+Count)?\s*:?\s*\n?\s*([\d,]+)\s*$', body)
+              if match:
+                  return count(match.group(1))
+              # Failed card present but showing a dash / empty value means zero
+              if re.search(r'(?im)^\s*Failed\s*\n\s*[-–—]\s*$', body):
+                  return 0
               return None
 
           def date_from_body(body):
@@ -865,6 +873,10 @@ jobs:
                       'Failed': failed_count(body),
                       'Actual Cost': money(body),
                   }
+                  if values['Failed'] is None and all(values[k] is not None for k in ('Audience Size', 'Sent', 'Delivered', 'Read', 'Actual Cost')):
+                      snippet = re.sub(r'\s*\n\s*', ' | ', body[max(0, body.find('Audience')):][:400])
+                      print(f'Failed metric not shown for {name}; recording 0. Page metrics text: {snippet}', flush=True)
+                      values['Failed'] = 0
                   missing = [key for key, value in values.items() if value is None]
                   if missing:
                       raise RuntimeError(f'Missing metrics for {name}: {missing}')
@@ -1622,4 +1634,3 @@ jobs:
           )
           print('Recorded failure status in Dashboard; last successful sync timestamp retained.')
           PY
-
