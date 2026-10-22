@@ -456,11 +456,18 @@ jobs:
 
           def wait_for_list(page, payloads=None):
               failures = []
+              auth_status = {}
+              auth_first_failure = [None]
               def failed(request):
                   parsed = urlsplit(request.url)
                   failures.append({'url': parsed.scheme + '://' + parsed.netloc + parsed.path,
                                    'error': str(request.failure or 'request failed')})
               def response_status(response):
+                  parsed = urlsplit(response.url)
+                  if parsed.hostname == 'backend.aisensy.com':
+                      auth_status[parsed.path] = response.status
+                      if response.status == 401 and auth_first_failure[0] is None:
+                          auth_first_failure[0] = time.monotonic()
                   if response.status >= 400:
                       parsed = urlsplit(response.url)
                       failures.append({'url': parsed.scheme + '://' + parsed.netloc + parsed.path,
@@ -505,6 +512,22 @@ jobs:
                                   return
                           except PlaywrightTimeoutError:
                               pass
+                          # Allow the app time to refresh an initially rejected access token.
+                          # Only fail early when refresh itself is rejected and several APIs
+                          # remain unauthorized; successful responses replace earlier failures.
+                          refresh_rejected = any(
+                              'get-new-agent-token' in path and status == 401
+                              for path, status in auth_status.items())
+                          rejected = sum(status == 401 for status in auth_status.values())
+                          if (refresh_rejected and rejected >= 3 and
+                                  auth_first_failure[0] is not None and
+                                  time.monotonic() - auth_first_failure[0] >= 10):
+                              save_list_diagnostics(page, failures)
+                              raise RuntimeError(
+                                  'AISENSY_LOGIN_EXPIRED: AiSensy rejected the saved login and '
+                                  'its token-refresh request (HTTP 401). Sign in again using the '
+                                  'login-refresh helper, replace the AISENSY_SESSION GitHub Actions '
+                                  'secret, then rerun. Broadcast rows have not been updated.')
                           page.wait_for_timeout(500)
                       print(f'Campaign list not ready on attempt {attempt}/2; location: {page.url.split("?")[0]}', flush=True)
                   save_list_diagnostics(page, failures)
