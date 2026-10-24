@@ -21,6 +21,10 @@ on:
         description: 'Also capture message content (slower)'
         type: boolean
         default: false
+      clear_tab:
+        description: 'Delete everything in Broadcast History first and refetch from scratch'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -33,7 +37,7 @@ concurrency:
 jobs:
   backfill:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 355
     steps:
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -55,6 +59,7 @@ jobs:
           END_DATE: ${{ inputs.end_date }}
           REFRESH_EXISTING: ${{ inputs.refresh_existing }}
           INCLUDE_CONTENT: ${{ inputs.include_content }}
+          CLEAR_TAB: ${{ inputs.clear_tab }}
         run: |
           python - <<'PY'
           import json
@@ -102,7 +107,7 @@ jobs:
           TAB_NAME = 'Broadcast History'
           MAX_LIST_PAGES = 150          # safety cap on list pagination
           FLUSH_EVERY = 20              # write to the sheet after this many fetched campaigns
-          DISCOVERY_BUFFER_DAYS = 2     # also look at campaigns created slightly before the start (scheduled sends)
+          DISCOVERY_BUFFER_DAYS = 0     # only campaigns created on/after the start date
           FINAL_AFTER_HOURS = 18        # after this, metrics are treated as final and not re-fetched
 
           START = datetime.strptime(os.environ.get('START_DATE', '').strip() or '2026-08-07', '%Y-%m-%d').replace(tzinfo=IST)
@@ -110,6 +115,7 @@ jobs:
           END = (datetime.strptime(_end_raw, '%Y-%m-%d').replace(tzinfo=IST) + timedelta(days=1)) if _end_raw else None  # exclusive
           REFRESH_EXISTING = os.environ.get('REFRESH_EXISTING', 'false').lower() == 'true'
           INCLUDE_CONTENT = os.environ.get('INCLUDE_CONTENT', 'false').lower() == 'true'
+          CLEAR_TAB = os.environ.get('CLEAR_TAB', 'false').lower() == 'true'
           DISCOVERY_CUTOFF = START - timedelta(days=DISCOVERY_BUFFER_DAYS)
 
           HEADERS = [
@@ -861,6 +867,11 @@ jobs:
               history_ws = spreadsheet.add_worksheet(title=TAB_NAME, rows=500, cols=len(HEADERS))
               print(f'Created tab "{TAB_NAME}".', flush=True)
 
+          if CLEAR_TAB:
+              # Fresh start: wipe everything in this tab only (other tabs are untouched).
+              history_ws.clear()
+              history_ws.update(range_name='A1', values=[HEADERS], value_input_option='RAW')
+              print(f'Cleared all existing rows from "{TAB_NAME}"; refetching from scratch.', flush=True)
           records = read_existing(history_ws)
           row_count_on_sheet = len(history_ws.get_all_values()) or 1
           if records:
