@@ -802,7 +802,8 @@ jobs:
 
 
           def write_table(ws, records, previous_rows, final=False):
-              ordered = sorted(records.values(), key=sort_time, reverse=True)
+              # Oldest first: the start date sits at the top, today's broadcasts at the bottom.
+              ordered = sorted(records.values(), key=lambda rec: (sort_time(rec), str(rec.get('Campaign ID', ''))))
               values = [HEADERS] + [['' if rec.get(h) is None else rec.get(h, '') for h in HEADERS] for rec in ordered]
               if ws.row_count < len(values):
                   ws.add_rows(len(values) - ws.row_count)
@@ -861,7 +862,11 @@ jobs:
               print(f'Created tab "{TAB_NAME}".', flush=True)
 
           records = read_existing(history_ws)
-          row_count_on_sheet = len(records) + 1
+          row_count_on_sheet = len(history_ws.get_all_values()) or 1
+          if records:
+              # Re-sort rows already in the tab (oldest first) before fetching anything new.
+              row_count_on_sheet = write_table(history_ws, records, row_count_on_sheet)
+              print(f'Re-sorted {len(records)} existing row(s): oldest first.', flush=True)
           known_by_row = {}
           for cid, rec in records.items():
               dt = parse_ist(rec.get('Created At (IST)'))
@@ -897,8 +902,10 @@ jobs:
                           if id(cand) in resolved:
                               cand['id'] = resolved[id(cand)]
 
+              # The AiSensy list is read newest -> oldest, but fetch oldest -> newest so the
+              # tab fills in date order starting from the start date.
               queue, seen = [], set()
-              for cand in candidates:
+              for cand in sorted(candidates, key=lambda c: c['dt']):
                   cid = cand.get('id')
                   if not cid or cid in seen:
                       continue
