@@ -1,0 +1,961 @@
+name: Backfill AiSensy Broadcast History
+
+# Run manually from the Actions tab. Safe to rerun: it skips broadcasts that are
+# already final in the tab and picks up wherever a previous run stopped.
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: 'First broadcast date to include (YYYY-MM-DD, IST)'
+        required: true
+        default: '2026-08-07'
+      end_date:
+        description: 'Last broadcast date to include (YYYY-MM-DD). Leave blank for today.'
+        required: false
+        default: ''
+      refresh_existing:
+        description: 'Re-fetch broadcasts already marked Final in the tab'
+        type: boolean
+        default: false
+      include_content:
+        description: 'Also capture message content (slower)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Shares the lock with the 2-hourly sync so the two never hit AiSensy or the sheet at once.
+concurrency:
+  group: aisensy-google-sheets-sync
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install playwright gspread google-auth
+          python -m playwright install --with-deps chromium
+
+      - name: Fetch every broadcast in the date range into Broadcast History
+        env:
+          AISENSY_SESSION: ${{ secrets.AISENSY_SESSION }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          GOOGLE_SHEET_ID: ${{ vars.GOOGLE_SHEET_ID }}
+          START_DATE: ${{ inputs.start_date }}
+          END_DATE: ${{ inputs.end_date }}
+          REFRESH_EXISTING: ${{ inputs.refresh_existing }}
+          INCLUDE_CONTENT: ${{ inputs.include_content }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          import time
+          from pathlib import Path
+          from urllib.parse import urlsplit
+          from contextlib import contextmanager
+          from datetime import datetime, timedelta, timezone
+          from zoneinfo import ZoneInfo
+          from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+          import gspread
+          from gspread.http_client import HTTPClient
+          from gspread.exceptions import APIError
+          from google.oauth2.service_account import Credentials
+
+
+          class QuotaSafeHTTPClient(HTTPClient):
+              """Space writes and retry only explicit quota rejections."""
+              def request(self, method, endpoint, *args, **kwargs):
+                  write = method.lower() not in ('get', 'head', 'options')
+                  for attempt in range(5):
+                      if write:
+                          remaining = getattr(self, '_next_write_at', 0) - time.monotonic()
+                          if remaining > 0:
+                              time.sleep(remaining)
+                          self._next_write_at = time.monotonic() + 1.25
+                      try:
+                          return super().request(method, endpoint, *args, **kwargs)
+                      except APIError as exc:
+                          if exc.response.status_code != 429 or attempt == 4:
+                              raise
+                          delay = min(60, 15 * (2 ** attempt))
+                          print(f'Google Sheets quota reached; retrying in {delay}s ({attempt+1}/4).', flush=True)
+                          time.sleep(delay)
+
+
+          # ---------------------------------------------------------------- settings
+          PROJECT_ID = '6589906ef69fc70b424e0e43'
+          LIST_URL = f'https://app.aisensy.com/projects/{PROJECT_ID}/campaigns/all'
+          SHEET_ID = os.environ.get('GOOGLE_SHEET_ID', '').strip() or '1jXnQPQngi-FbEBBHC0tvaOTXxmtE5_miv6Mq0rTbmLQ'
+          IST = ZoneInfo('Asia/Kolkata')
+          TAB_NAME = 'Broadcast History'
+          MAX_LIST_PAGES = 150          # safety cap on list pagination
+          FLUSH_EVERY = 20              # write to the sheet after this many fetched campaigns
+          DISCOVERY_BUFFER_DAYS = 2     # also look at campaigns created slightly before the start (scheduled sends)
+          FINAL_AFTER_HOURS = 18        # after this, metrics are treated as final and not re-fetched
+
+          START = datetime.strptime(os.environ.get('START_DATE', '').strip() or '2026-08-07', '%Y-%m-%d').replace(tzinfo=IST)
+          _end_raw = os.environ.get('END_DATE', '').strip()
+          END = (datetime.strptime(_end_raw, '%Y-%m-%d').replace(tzinfo=IST) + timedelta(days=1)) if _end_raw else None  # exclusive
+          REFRESH_EXISTING = os.environ.get('REFRESH_EXISTING', 'false').lower() == 'true'
+          INCLUDE_CONTENT = os.environ.get('INCLUDE_CONTENT', 'false').lower() == 'true'
+          DISCOVERY_CUTOFF = START - timedelta(days=DISCOVERY_BUFFER_DAYS)
+
+          HEADERS = [
+              'Campaign ID', 'Campaign Name', 'Created At (IST)', 'Sent At (IST)', 'Time Source',
+              'Send Day', 'Send Hour', 'Audience Size', 'Sent', 'Delivered', 'Read', 'Failed',
+              'Clicked', 'Replied', 'Delivery Rate', 'Read Rate', 'Click Rate', 'Reply Rate',
+              'Actual Cost (INR)', 'Cost per Sent', 'Cost per Read', 'Data Status',
+              'Last Updated (IST)', 'Message Content',
+          ]
+          LAST_COL = 'X'
+          STAMP_FMT = '%Y-%m-%d %I:%M:%S %p IST'
+
+
+          # ---------------------------------------------------------------- small helpers
+          def fmt(dt):
+              return dt.astimezone(IST).strftime(STAMP_FMT)
+
+
+          def ist_now():
+              return fmt(datetime.now(IST))
+
+
+          def parse_ist(value):
+              value = str(value or '').strip()
+              for f in (STAMP_FMT, '%Y-%m-%d'):
+                  try:
+                      return datetime.strptime(value, f).replace(tzinfo=IST)
+                  except ValueError:
+                      pass
+              return None
+
+
+          def number(value, default=0.0):
+              try:
+                  return float(re.sub(r'[^0-9.\-]', '', str(value)))
+              except (TypeError, ValueError):
+                  return default
+
+
+          def count(value):
+              return int(number(value))
+
+
+          def optional_count(value):
+              if value is None or str(value).strip() == '':
+                  return None
+              return count(value)
+
+
+          def norm_key(key):
+              return re.sub(r'[^a-z0-9]', '', str(key).lower())
+
+
+          def metric(body, label):
+              match = re.search(rf'(?im)^\s*{re.escape(label)}\s*\n\s*([\d,]+)\s*$', body)
+              return count(match.group(1)) if match else None
+
+
+          def money(body):
+              match = re.search(r'(?im)^\s*Total Credit Usage\s*\n\s*₹\s*([\d,]+(?:\.\d+)?)', body)
+              return number(match.group(1)) if match else None
+
+
+          def failed_count(body):
+              direct = metric(body, 'Failed')
+              if direct is not None:
+                  return direct
+              match = re.search(r'(?i)[\d.]+\s*%\s*\(\s*([\d,]+)\s*\)\s*(?:PRO\s*)?Failed\b', body)
+              if match:
+                  return count(match.group(1))
+              match = re.search(r'(?im)^\s*Failed(?:\s+Messages|\s+Count)?\s*:?\s*\n?\s*([\d,]+)\s*$', body)
+              if match:
+                  return count(match.group(1))
+              if re.search(r'(?im)^\s*Failed\s*\n\s*[-–—]\s*$', body):
+                  return 0
+              return None
+
+
+          def labelled_count(body, payloads, campaign_id, labels, fields):
+              """Page card first, then only a campaign-level response object with this exact ID."""
+              for label in labels:
+                  direct = metric(body, label)
+                  if direct is not None:
+                      return direct
+              alternatives = '|'.join(re.escape(label) for label in labels)
+              match = re.search(rf'(?i)[\d.]+\s*%\s*\(\s*([\d,]+)\s*\)\s*(?:PRO\s*)?(?:{alternatives})\b', body)
+              if match:
+                  return count(match.group(1))
+              values = set()
+
+              def walk(value):
+                  if isinstance(value, list):
+                      for item in value:
+                          walk(item)
+                  elif isinstance(value, dict):
+                      f = {norm_key(k): v for k, v in value.items()}
+                      ids = [str(f[k]) for k in ('id', 'campaignid', 'broadcastid') if k in f]
+                      if campaign_id in ids and not any(k in f for k in ('messageid', 'contactid', 'recipientid')):
+                          for field in fields:
+                              raw = f.get(field)
+                              if raw is not None and not isinstance(raw, bool) and re.fullmatch(r'\d+(?:\.0+)?', str(raw)):
+                                  values.add(int(float(raw)))
+                      for item in value.values():
+                          if isinstance(item, (dict, list)):
+                              walk(item)
+              for payload in payloads:
+                  walk(payload)
+              return next(iter(values)) if len(values) == 1 else None
+
+
+          # ---------------------------------------------------------------- timestamps
+          def sent_time_from_body(body):
+              label = re.compile(r'^(?:Broadcast Sent At|Campaign Sent At|Sent At|Sent On)\s*(?::\s*(.*))?$', re.I)
+              lines = [line.strip() for line in body.splitlines() if line.strip()]
+              for index, line in enumerate(lines):
+                  match = label.fullmatch(line)
+                  if not match:
+                      continue
+                  value = (match.group(1) or '').strip()
+                  if not value and index + 1 < len(lines):
+                      value = lines[index + 1]
+                  if not re.search(r'\d{1,2}:\d{2}', value):
+                      continue
+                  tz_match = re.search(r'\s*(IST|UTC|GMT|Z|[+-]\d{2}:?\d{2})$', value, re.I)
+                  if not tz_match:
+                      continue
+                  zone = tz_match.group(1).upper()
+                  stamp = value[:tz_match.start()].strip().rstrip(',').strip()
+                  if zone == 'IST':
+                      tz = IST
+                  elif zone in ('UTC', 'GMT', 'Z'):
+                      tz = timezone.utc
+                  else:
+                      try:
+                          offset = zone if ':' in zone else zone[:3] + ':' + zone[3:]
+                          tz = datetime.fromisoformat('2000-01-01T00:00:00' + offset).tzinfo
+                      except ValueError:
+                          continue
+                  parsed = None
+                  try:
+                      parsed = datetime.fromisoformat(stamp)
+                  except ValueError:
+                      for f in ('%b %d, %Y %I:%M:%S %p', '%b %d, %Y %I:%M %p',
+                                '%B %d, %Y %I:%M:%S %p', '%B %d, %Y %I:%M %p',
+                                '%b %d, %Y, %I:%M:%S %p', '%b %d, %Y, %I:%M %p',
+                                '%b %d, %Y %H:%M:%S', '%b %d, %Y %H:%M',
+                                '%Y-%m-%d %I:%M:%S %p', '%Y-%m-%d %I:%M %p'):
+                          try:
+                              parsed = datetime.strptime(stamp, f)
+                              break
+                          except ValueError:
+                              pass
+                  if parsed is not None:
+                      return fmt(parsed.replace(tzinfo=tz))
+              return ''
+
+
+          def actual_sent_value(value):
+              if isinstance(value, bool) or value is None:
+                  return ''
+              if isinstance(value, (int, float)) or re.fullmatch(r'\d{10}(?:\.\d+)?|\d{13}', str(value).strip()):
+                  try:
+                      seconds = float(value)
+                      if seconds >= 1e12:
+                          seconds /= 1000
+                      parsed = datetime.fromtimestamp(seconds, timezone.utc)
+                      if 2000 <= parsed.year <= 2100:
+                          return fmt(parsed)
+                  except (ValueError, OverflowError, OSError):
+                      pass
+                  return ''
+              return sent_time_from_body('Sent At: ' + str(value))
+
+
+          def sent_time_from_responses(payloads, campaign_id):
+              allowed = {'sentat', 'senton', 'senttime', 'senttimestamp', 'sentdatetime',
+                         'broadcastsentat', 'broadcastsenttime', 'campaignsentat',
+                         'actualsentat', 'actualsenttime', 'actualsenttimestamp'}
+              found = set()
+
+              def walk(value):
+                  if isinstance(value, list):
+                      for item in value:
+                          walk(item)
+                  elif isinstance(value, dict):
+                      ids = [str(v) for k, v in value.items() if norm_key(k) in {'id', 'campaignid', 'broadcastid'} and not isinstance(v, (dict, list))]
+                      if campaign_id in ids and not any(norm_key(k) in {'messageid', 'contactid', 'recipientid', 'phone', 'phonenumber'} for k in value):
+                          for key, item in value.items():
+                              if norm_key(key) in allowed:
+                                  stamp = actual_sent_value(item)
+                                  if stamp:
+                                      found.add(stamp)
+                      for item in value.values():
+                          if isinstance(item, (dict, list)):
+                              walk(item)
+              for payload in payloads:
+                  walk(payload)
+              return next(iter(found)) if len(found) == 1 else ''
+
+
+          def displayed_campaign_time(text):
+              """'Oct 20, 2026, 11:30 AM' as shown in the list (browser runs in IST) -> IST stamp."""
+              value = str(text or '').strip()
+              explicit = actual_sent_value(value)
+              if explicit:
+                  return explicit
+              for f in ('%b %d, %Y, %I:%M:%S %p', '%b %d, %Y, %I:%M %p',
+                        '%b %d, %Y %I:%M:%S %p', '%b %d, %Y %I:%M %p'):
+                  try:
+                      return datetime.strptime(value, f).strftime(STAMP_FMT)
+                  except ValueError:
+                      pass
+              return ''
+
+
+          def minute_key(dt):
+              return dt.astimezone(IST).strftime('%Y-%m-%d %H:%M')
+
+
+          # ---------------------------------------------------------------- network capture
+          @contextmanager
+          def json_responses(page, limit=150):
+              payloads = []
+
+              def capture(response):
+                  if len(payloads) >= limit or response.request.resource_type not in ('xhr', 'fetch'):
+                      return
+                  if not re.match(r'https://(?:[A-Za-z0-9-]+\.)*aisensy\.com/', response.url, re.I):
+                      return
+                  try:
+                      if response.ok and 'json' in response.headers.get('content-type', '').lower():
+                          value = response.json()
+                          if isinstance(value, (dict, list)):
+                              payloads.append(value)
+                  except Exception:
+                      pass
+              page.on('response', capture)
+              try:
+                  yield payloads
+              finally:
+                  page.remove_listener('response', capture)
+
+
+          def api_campaign_index(payloads):
+              """(campaign name, created minute IST) -> set of campaign IDs, from list API responses."""
+              index = {}
+
+              def walk(value):
+                  if isinstance(value, list):
+                      for item in value:
+                          walk(item)
+                  elif isinstance(value, dict):
+                      f = {norm_key(k): v for k, v in value.items()}
+                      kind = str(f.get('campaigntype') or f.get('type') or '').upper()
+                      status = str(f.get('status') or f.get('campaignstatus') or '').upper()
+                      cid = f.get('campaignid') or f.get('id') or f.get('_id')
+                      name = f.get('campaignname') or f.get('name')
+                      created = f.get('createdat') or f.get('created')
+                      if (kind == 'BROADCAST' and status == 'SENT' and isinstance(cid, str)
+                              and re.fullmatch(r'[A-Za-z0-9]+', cid) and isinstance(name, str) and created):
+                          dt = parse_ist(actual_sent_value(created))
+                          if dt:
+                              index.setdefault((name.strip(), minute_key(dt)), set()).add(cid)
+                      for item in value.values():
+                          if isinstance(item, (dict, list)):
+                              walk(item)
+              for payload in payloads:
+                  walk(payload)
+              return index
+
+
+          # ---------------------------------------------------------------- campaign list
+          def save_list_diagnostics(page, failures):
+              folder = Path('aisensy-debug')
+              folder.mkdir(exist_ok=True)
+              info = {'url': page.url.split('?')[0], 'network': failures[-15:]}
+              try:
+                  info['page'] = page.evaluate(r"""() => ({
+                      title: document.title,
+                      passwordForm: !!document.querySelector('input[type="password"]'),
+                      bodyCharacters: (document.body?.innerText || '').length,
+                      pagination: ((document.body?.innerText || '').match(/\d+\s*[-–]\s*\d+\s+of\s+[\d,]+/i) || [null])[0],
+                      headings: [...document.querySelectorAll('h1,h2,h3,[role="heading"]')].map(el=>el.innerText).slice(0,12),
+                  })""")
+                  page.screenshot(path=str(folder / 'campaign-list.png'), full_page=False,
+                                  mask=[page.locator('input')], timeout=10000)
+              except Exception as exc:
+                  info['diagnostic_error'] = type(exc).__name__
+              (folder / 'loading-report.json').write_text(json.dumps(info, indent=2))
+              print('AISENSY DIAGNOSTIC REPORT: ' + json.dumps(info), flush=True)
+
+
+          def wait_for_list(page):
+              failures = []
+              auth_status = {}
+              auth_first_failure = [None]
+
+              def failed(request):
+                  parsed = urlsplit(request.url)
+                  failures.append({'url': parsed.scheme + '://' + parsed.netloc + parsed.path,
+                                   'error': str(request.failure or 'request failed')})
+
+              def response_status(response):
+                  parsed = urlsplit(response.url)
+                  if parsed.hostname == 'backend.aisensy.com':
+                      auth_status[parsed.path] = response.status
+                      if response.status == 401 and auth_first_failure[0] is None:
+                          auth_first_failure[0] = time.monotonic()
+                  if response.status >= 400:
+                      failures.append({'url': parsed.scheme + '://' + parsed.netloc + parsed.path,
+                                       'status': response.status})
+              page.on('requestfailed', failed)
+              page.on('response', response_status)
+              try:
+                  for attempt in range(1, 3):
+                      try:
+                          page.goto(LIST_URL, wait_until='domcontentloaded', timeout=30000)
+                      except PlaywrightTimeoutError:
+                          print(f'Navigation slow on attempt {attempt}.', flush=True)
+                      search = page.locator('input[placeholder*="campaign" i]')
+                      if search.count() == 1 and search.is_visible() and search.input_value():
+                          search.fill('')
+                          print('Cleared saved campaign-name search filter.', flush=True)
+                      deadline = time.monotonic() + 40
+                      while time.monotonic() < deadline:
+                          try:
+                              state = page.evaluate(r"""() => {
+                                  const text = (document.body?.innerText || '').trim();
+                                  if (/\/(?:login|signup)(?:[/?#]|$)/i.test(location.pathname) ||
+                                      (document.querySelector('input[type="password"]') && /log\s*in|sign\s*in/i.test(text))) return 'login';
+                                  if (!/\/campaigns\/all(?:[/?#]|$)/.test(location.pathname)) return false;
+                                  const lines = text.split('\n').map(line=>line.trim()).filter(Boolean);
+                                  const typedRow = lines.some((line,index)=>
+                                      line === 'BROADCAST' && index > 0 &&
+                                      lines.slice(index+1,index+9).some(value=>/^(SENT|LIVE|PAUSED|STOPPED|DRAFT|SCHEDULED)$/i.test(value)));
+                                  const gridRows = [...document.querySelectorAll('table tbody tr,[role="rowgroup"] [role="row"]')]
+                                      .some(row=>/BROADCAST/i.test(row.innerText || ''));
+                                  return typedRow || gridRows ? 'ready' : false;
+                              }""")
+                              if state == 'login':
+                                  save_list_diagnostics(page, failures)
+                                  raise RuntimeError('AiSensy redirected to login. Refresh the AISENSY_SESSION secret. No sheet data was changed.')
+                              if state == 'ready':
+                                  page.wait_for_timeout(500)
+                                  return
+                          except PlaywrightTimeoutError:
+                              pass
+                          refresh_rejected = any('get-new-agent-token' in p and s == 401 for p, s in auth_status.items())
+                          rejected = sum(s == 401 for s in auth_status.values())
+                          if (refresh_rejected and rejected >= 3 and auth_first_failure[0] is not None
+                                  and time.monotonic() - auth_first_failure[0] >= 10):
+                              save_list_diagnostics(page, failures)
+                              raise RuntimeError('AISENSY_LOGIN_EXPIRED: AiSensy rejected the saved login (HTTP 401). '
+                                                 'Refresh the AISENSY_SESSION secret and rerun.')
+                          page.wait_for_timeout(500)
+                      print(f'Campaign list not ready on attempt {attempt}/2.', flush=True)
+                  save_list_diagnostics(page, failures)
+                  raise RuntimeError('AiSensy did not supply campaign rows after two attempts.')
+              finally:
+                  page.remove_listener('requestfailed', failed)
+                  page.remove_listener('response', response_status)
+
+
+          def maximise_rows_per_page(page):
+              """Pick the largest 'Rows per page' option so the scan needs fewer pages."""
+              try:
+                  label = page.get_by_text(re.compile(r'Rows per page', re.I)).first
+                  if label.count() == 0:
+                      return
+                  trigger = label.locator('xpath=following::*[@role="combobox" or @aria-haspopup="listbox"][1]')
+                  if trigger.count() == 0:
+                      return
+                  trigger.first.click(timeout=5000)
+                  options = page.locator('[role="listbox"] [role="option"]')
+                  options.first.wait_for(timeout=5000)
+                  sizes = [(int(re.sub(r'\D', '', text) or 0), i) for i, text in enumerate(options.all_inner_texts())]
+                  best = max(sizes) if sizes else (0, 0)
+                  if best[0] > 0:
+                      options.nth(best[1]).click(timeout=5000)
+                      page.wait_for_timeout(1500)
+                      print(f'Rows per page set to {best[0]}.', flush=True)
+                  else:
+                      page.keyboard.press('Escape')
+              except Exception as exc:
+                  print(f'Could not change rows per page ({type(exc).__name__}); using the default.', flush=True)
+                  try:
+                      page.keyboard.press('Escape')
+                  except Exception:
+                      pass
+
+
+          def tag_sent_rows(page):
+              """Return visible SENT broadcast rows and tag each row element with data-bf-row=<index>."""
+              return page.evaluate(r"""() => {
+                  document.querySelectorAll('[data-bf-row]').forEach(el => el.removeAttribute('data-bf-row'));
+                  const visible = el => !!(el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden');
+                  const date = /[A-Za-z]{3}\s+\d{1,2},\s+\d{4},?\s+\d{1,2}:\d{2}(?::\d{2})?\s*[AP]M/i;
+                  const out = [];
+                  const seen = new Set();
+                  for (const el of document.querySelectorAll('td,div,span,p')) {
+                      if (!visible(el) || el.textContent.trim() !== 'BROADCAST') continue;
+                      let row = el.parentElement;
+                      for (let depth = 0; row && depth < 8; depth++, row = row.parentElement) {
+                          const lines = (row.innerText || '').split('\n').map(x=>x.trim()).filter(Boolean);
+                          if (lines.filter(x=>x === 'BROADCAST').length > 1) break;
+                          const index = lines.indexOf('BROADCAST');
+                          const stamp = (row.innerText || '').match(date);
+                          if (index < 1 || !stamp || !lines.some(x=>/^sent$/i.test(x))) continue;
+                          const name = lines[index-1];
+                          if (/^(campaign|type|status|audience)$/i.test(name) || seen.has(row)) break;
+                          seen.add(row);
+                          row.setAttribute('data-bf-row', String(out.length));
+                          out.push({idx: out.length, name, created: stamp[0]});
+                          break;
+                      }
+                  }
+                  return out;
+              }""")
+
+
+          def signature(rows):
+              return tuple((r['name'], r['created']) for r in rows)
+
+
+          def read_list_state(page):
+              pager = page.evaluate(r"""() => ((document.body?.innerText||'').match(/\d+\s*[-–]\s*\d+\s+of\s+[\d,]+/i)||[''])[0]""")
+              return pager, tag_sent_rows(page)
+
+
+          def settle(page, prev=None, timeout=25):
+              """Wait until the list shows a page different from `prev` and is stable across two polls."""
+              deadline = time.monotonic() + timeout
+              last = None
+              while time.monotonic() < deadline:
+                  pager, rows = read_list_state(page)
+                  state = (pager, signature(rows))
+                  if (prev is None or state != prev) and (rows or pager):
+                      if state == last:
+                          return pager, rows
+                      last = state
+                  page.wait_for_timeout(600)
+              raise RuntimeError('Campaign list did not settle on a new page.')
+
+
+          def next_campaign_page(page):
+              locator = page.get_by_role('button', name=re.compile(r'^(?:go to |navigate to )?next(?: page)?$', re.I))
+              if locator.count() == 1:
+                  if not locator.is_enabled():
+                      return False
+                  locator.click(timeout=5000)
+                  return True
+              icon_button = page.locator('button').filter(has=page.locator('svg[data-testid="KeyboardArrowRightIcon"], svg[data-testid="ChevronRightIcon"]'))
+              if icon_button.count() == 1 and icon_button.is_enabled():
+                  icon_button.click(timeout=5000)
+                  return True
+              return False
+
+
+          def advance(page, pager, rows):
+              if not next_campaign_page(page):
+                  return None
+              return settle(page, prev=(pager, signature(rows)))
+
+
+          def goto_list_page(page, page_no):
+              wait_for_list(page)
+              maximise_rows_per_page(page)
+              pager, rows = settle(page)
+              for _ in range(page_no):
+                  result = advance(page, pager, rows)
+                  if result is None:
+                      raise RuntimeError(f'Could not reach list page {page_no + 1}.')
+                  pager, rows = result
+              return rows
+
+
+          def discover(page):
+              """Scan the campaign list newest -> oldest and collect SENT broadcasts in the date window."""
+              wait_for_list(page)
+              maximise_rows_per_page(page)
+              pager, rows = settle(page)
+              candidates, page_signatures = [], []
+              descending, previous_dt = True, None
+              page_no = 0
+              while True:
+                  for r in rows:
+                      dt = parse_ist(displayed_campaign_time(r['created']))
+                      if dt is None:
+                          raise RuntimeError(f"Could not parse list date {r['created']!r}; refusing to guess.")
+                      r['dt'] = dt
+                      if previous_dt and dt > previous_dt + timedelta(minutes=1) and descending:
+                          descending = False
+                          print('List is not strictly newest-first; scanning every page instead of stopping early.', flush=True)
+                      previous_dt = dt
+                  page_signatures.append(signature(rows))
+                  in_range = [r for r in rows if r['dt'] >= DISCOVERY_CUTOFF and (END is None or r['dt'] < END)]
+                  candidates += [{**r, 'page_no': page_no} for r in in_range]
+                  print(f'List page {page_no + 1} ({pager or "no pager text"}): {len(rows)} sent broadcasts, {len(in_range)} in window.', flush=True)
+                  if rows and descending and all(r['dt'] < DISCOVERY_CUTOFF for r in rows):
+                      print('Reached broadcasts older than the start date; list scan complete.', flush=True)
+                      break
+                  if page_no + 1 >= MAX_LIST_PAGES:
+                      raise RuntimeError(f'Reached the {MAX_LIST_PAGES}-page safety limit before the start date.')
+                  result = advance(page, pager, rows)
+                  if result is None:
+                      print('Reached the last list page.', flush=True)
+                      break
+                  pager, rows = result
+                  page_no += 1
+              return candidates, page_signatures
+
+
+          def resolve_ids_by_click(page, pending, page_signatures):
+              """Open each unresolved row from its own list page and read the ID from the URL."""
+              resolved, failed = {}, []
+              current = None
+              for cand in sorted(pending, key=lambda c: c['page_no']):
+                  try:
+                      if current != cand['page_no']:
+                          goto_list_page(page, cand['page_no'])
+                      rows = tag_sent_rows(page)
+                      match = [r for r in rows if r['name'] == cand['name'] and r['created'] == cand['created']]
+                      if len(match) != 1:
+                          raise RuntimeError('row not found uniquely on its list page')
+                      row = page.locator(f'[data-bf-row="{match[0]["idx"]}"]')
+                      row.get_by_text(cand['name'], exact=True).first.click(timeout=15000)
+                      page.wait_for_url(re.compile(r'/campaigns/all/view/[A-Za-z0-9]+'), timeout=20000)
+                      resolved[id(cand)] = re.search(r'/view/([A-Za-z0-9]+)', page.url).group(1)
+                      current = None
+                      try:
+                          page.go_back(wait_until='domcontentloaded', timeout=20000)
+                          _, rows = settle(page, timeout=15)
+                          if signature(rows) == page_signatures[cand['page_no']]:
+                              current = cand['page_no']
+                      except Exception:
+                          current = None
+                  except Exception as exc:
+                      failed.append(cand)
+                      current = None
+                      print(f"WARNING: could not resolve ID for {cand['name']} ({cand['created']}): {exc}", flush=True)
+              return resolved, failed
+
+
+          # ---------------------------------------------------------------- campaign detail
+          def content_from_preview(page):
+              return page.evaluate(r"""() => {
+                  const forbidden = /Campaign Type|Total Credit Usage|Campaign Messages \(per day\)|Rows per page:|Created At|Campaign Duration|Template Name/i;
+                  const cards = new Set();
+                  const anchors = [...document.querySelectorAll('span,p,div')].filter(el =>
+                      (el.textContent || '').trim() === 'Campaign Duration');
+                  for (const anchor of anchors) {
+                      let details = anchor.parentElement;
+                      for (let depth=0; details && depth<7; depth++,details=details.parentElement) {
+                          if (details.tagName === 'BODY' || details.tagName === 'HTML') break;
+                          const detailText = details.innerText || '';
+                          if (!/Campaign Type/i.test(detailText) || !/Campaign Duration/i.test(detailText)) continue;
+                          const card = details.nextElementSibling;
+                          if (!card || !card.getClientRects().length) continue;
+                          const text = (card.innerText || '').trim();
+                          if (text.length < 40 || text.length > 48000 || forbidden.test(text)) continue;
+                          cards.add(card);
+                      }
+                  }
+                  const candidates = [...cards];
+                  const outer = candidates.filter(el => candidates.every(other => el === other || el.contains(other)));
+                  if (outer.length !== 1) return '';
+                  const card = outer[0];
+                  let text = (card.innerText || '').trim();
+                  const links = [...card.querySelectorAll('a[href]')].map(a=>a.href).filter(u=>/^https?:/.test(u));
+                  const media = [...card.querySelectorAll('video,video source,img[src]')].map(el=>el.currentSrc || el.src).filter(u=>u && /^https?:/.test(u) && !/logo|icon|avatar|whatsapp/i.test(u));
+                  for (const url of [...new Set([...links,...media])]) if (!text.includes(url)) text += '\n' + url;
+                  return text;
+              }""")
+
+
+          def fetch_content(page, campaign_id):
+              try:
+                  page.evaluate('''() => {
+                      window.scrollTo(0, document.body.scrollHeight);
+                      for (const el of document.querySelectorAll('main,section,div')) {
+                          const overflow = getComputedStyle(el).overflowY;
+                          if (/(auto|scroll)/.test(overflow) && el.scrollHeight > el.clientHeight) el.scrollTop = el.scrollHeight;
+                      }
+                  }''')
+                  page.wait_for_timeout(800)
+                  return content_from_preview(page) or ''
+              except Exception as exc:
+                  print(f'Content lookup failed for {campaign_id}: {type(exc).__name__}', flush=True)
+                  return ''
+
+
+          def fetch_details(page, campaign_id):
+              page.goto('about:blank')
+              with json_responses(page) as payloads:
+                  page.goto(f'{LIST_URL}/view/{campaign_id}', wait_until='domcontentloaded', timeout=30000)
+                  page.wait_for_url(re.compile(rf'/campaigns/all/view/{re.escape(campaign_id)}(?:[/?#]|$)'), timeout=30000)
+                  page.get_by_text('Total Credit Usage', exact=True).first.wait_for(timeout=30000)
+                  page.wait_for_timeout(700)
+                  body = page.locator('body').inner_text()
+                  status = re.search(r'(?im)^\s*Status\s*\n\s*([A-Z_]+)', body)
+                  if not status or status.group(1).upper() != 'SENT':
+                      raise RuntimeError('campaign is not confirmed SENT')
+                  kind = re.search(r'(?im)^\s*Campaign Type\s*\n\s*([A-Z_]+)', body)
+                  if not kind or kind.group(1).upper() != 'BROADCAST':
+                      raise RuntimeError('campaign is not confirmed BROADCAST')
+                  values = {
+                      'Audience Size': metric(body, 'Audience'),
+                      'Sent': metric(body, 'Sent'),
+                      'Delivered': metric(body, 'Delivered'),
+                      'Read': metric(body, 'Read'),
+                      'Failed': failed_count(body),
+                      'Actual Cost': money(body),
+                  }
+                  if values['Failed'] is None and all(values[k] is not None for k in ('Audience Size', 'Sent', 'Delivered', 'Read', 'Actual Cost')):
+                      values['Failed'] = 0
+                  missing = [k for k, v in values.items() if v is None]
+                  if missing:
+                      raise RuntimeError(f'missing metrics: {missing}')
+                  return {
+                      **values,
+                      'Sent At': sent_time_from_responses(payloads, campaign_id) or sent_time_from_body(body),
+                      'Clicked': labelled_count(body, payloads, campaign_id, ('Clicked',),
+                                                ('clicked', 'clickedcount', 'clickcount', 'totalclicked')),
+                      'Replied': labelled_count(body, payloads, campaign_id, ('Replied', 'Replies'),
+                                                ('replied', 'repliedcount', 'replycount', 'totalreplied', 'replies', 'totalreplies')),
+                      'Message Content': fetch_content(page, campaign_id) if INCLUDE_CONTENT else '',
+                  }
+
+
+          # ---------------------------------------------------------------- sheet
+          def read_existing(ws):
+              rows = ws.get_all_values(value_render_option='UNFORMATTED_VALUE')
+              if not rows:
+                  return {}
+              header = [str(h).strip() for h in rows[0]]
+              existing = {}
+              for row in rows[1:]:
+                  rec = {h: (row[i] if i < len(row) else '') for i, h in enumerate(header)}
+                  cid = str(rec.get('Campaign ID', '')).strip()
+                  if cid:
+                      existing[cid] = rec
+              return existing
+
+
+          def build_record(cid, name, created_dt, d, old):
+              explicit = d['Sent At']
+              if explicit:
+                  sent_at, source = explicit, 'Sent timestamp'
+              elif old.get('Time Source') == 'Sent timestamp' and old.get('Sent At (IST)'):
+                  sent_at, source = str(old['Sent At (IST)']), 'Sent timestamp'
+              else:
+                  sent_at, source = fmt(created_dt), 'Created time'
+              effective = parse_ist(sent_at) or created_dt
+              sent, delivered, read = count(d['Sent']), count(d['Delivered']), count(d['Read'])
+              cost = number(d['Actual Cost'])
+              clicked = d['Clicked'] if d['Clicked'] is not None else optional_count(old.get('Clicked'))
+              replied = d['Replied'] if d['Replied'] is not None else optional_count(old.get('Replied'))
+              final = datetime.now(IST) - effective >= timedelta(hours=FINAL_AFTER_HOURS)
+              return {
+                  'Campaign ID': cid,
+                  'Campaign Name': name,
+                  'Created At (IST)': fmt(created_dt),
+                  'Sent At (IST)': sent_at,
+                  'Time Source': source,
+                  'Send Day': effective.strftime('%a'),
+                  'Send Hour': effective.hour,
+                  'Audience Size': count(d['Audience Size']),
+                  'Sent': sent,
+                  'Delivered': delivered,
+                  'Read': read,
+                  'Failed': count(d['Failed']),
+                  'Clicked': '' if clicked is None else clicked,
+                  'Replied': '' if replied is None else replied,
+                  'Delivery Rate': delivered / sent if sent else 0,
+                  'Read Rate': read / delivered if delivered else 0,
+                  'Click Rate': clicked / delivered if clicked is not None and delivered else '',
+                  'Reply Rate': replied / delivered if replied is not None and delivered else '',
+                  'Actual Cost (INR)': cost,
+                  'Cost per Sent': cost / sent if sent else 0,
+                  'Cost per Read': cost / read if read else '',
+                  'Data Status': 'Final' if final else 'Still collecting',
+                  'Last Updated (IST)': ist_now(),
+                  'Message Content': d['Message Content'] or old.get('Message Content', ''),
+              }
+
+
+          def sort_time(rec):
+              return (parse_ist(rec.get('Sent At (IST)')) or parse_ist(rec.get('Created At (IST)'))
+                      or datetime(1970, 1, 1, tzinfo=IST))
+
+
+          def write_table(ws, records, previous_rows, final=False):
+              ordered = sorted(records.values(), key=sort_time, reverse=True)
+              values = [HEADERS] + [['' if rec.get(h) is None else rec.get(h, '') for h in HEADERS] for rec in ordered]
+              if ws.row_count < len(values):
+                  ws.add_rows(len(values) - ws.row_count)
+              if ws.col_count < len(HEADERS):
+                  ws.add_cols(len(HEADERS) - ws.col_count)
+              ws.update(range_name='A1', values=values, value_input_option='RAW')
+              if previous_rows > len(values):
+                  ws.batch_clear([f'A{len(values)+1}:{LAST_COL}{previous_rows}'])
+              if final and len(values) > 1:
+                  n = len(values)
+                  ws.batch_format([
+                      {'range': f'A1:{LAST_COL}1', 'format': {'textFormat': {'bold': True}, 'wrapStrategy': 'WRAP'}},
+                      {'range': f'C2:D{n}', 'format': {'numberFormat': {'type': 'TEXT'}}},
+                      {'range': f'W2:W{n}', 'format': {'numberFormat': {'type': 'TEXT'}}},
+                      {'range': f'G2:G{n}', 'format': {'numberFormat': {'type': 'NUMBER', 'pattern': '0'}}},
+                      {'range': f'H2:N{n}', 'format': {'numberFormat': {'type': 'NUMBER', 'pattern': '#,##0'}}},
+                      {'range': f'O2:R{n}', 'format': {'numberFormat': {'type': 'PERCENT', 'pattern': '0.00%'}}},
+                      {'range': f'S2:S{n}', 'format': {'numberFormat': {'type': 'CURRENCY', 'pattern': '₹#,##0.00'}}},
+                      {'range': f'T2:U{n}', 'format': {'numberFormat': {'type': 'CURRENCY', 'pattern': '₹#,##0.000'}}},
+                      {'range': f'X2:X{n}', 'format': {'wrapStrategy': 'CLIP', 'verticalAlignment': 'TOP'}},
+                  ])
+                  ws.freeze(rows=1, cols=2)
+                  ws.set_basic_filter(f'A1:{LAST_COL}{n}')
+              return len(values)
+
+
+          # ---------------------------------------------------------------- main
+          session_json = os.environ.get('AISENSY_SESSION', '').strip()
+          google_json = (os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '').strip()
+                         or os.environ.get('GOOGLE_CREDENTIALS', '').strip())
+          if not session_json:
+              raise RuntimeError('Missing AISENSY_SESSION secret')
+          if not google_json:
+              raise RuntimeError('Missing GOOGLE_SERVICE_ACCOUNT_JSON secret')
+          session = json.loads(session_json)
+          if not isinstance(session, dict) or not isinstance(session.get('cookies', []), list) or not isinstance(session.get('origins', []), list):
+              raise RuntimeError('AISENSY_SESSION must contain Playwright storage-state JSON.')
+          origins = session.setdefault('origins', [])
+          app_origins = ('https://app.aisensy.com', 'https://www.app.aisensy.com')
+          saved_origins = {item.get('origin'): item for item in origins if isinstance(item, dict)}
+          for target in app_origins:
+              if target not in saved_origins:
+                  source = next((saved_origins[o] for o in app_origins if o in saved_origins), None)
+                  if source is not None:
+                      restored = json.loads(json.dumps(source))
+                      restored['origin'] = target
+                      origins.append(restored)
+
+          credentials = Credentials.from_service_account_info(
+              json.loads(google_json), scopes=['https://www.googleapis.com/auth/spreadsheets'])
+          spreadsheet = gspread.authorize(credentials, http_client=QuotaSafeHTTPClient).open_by_key(SHEET_ID)
+          try:
+              history_ws = spreadsheet.worksheet(TAB_NAME)
+          except gspread.WorksheetNotFound:
+              history_ws = spreadsheet.add_worksheet(title=TAB_NAME, rows=500, cols=len(HEADERS))
+              print(f'Created tab "{TAB_NAME}".', flush=True)
+
+          records = read_existing(history_ws)
+          row_count_on_sheet = len(records) + 1
+          known_by_row = {}
+          for cid, rec in records.items():
+              dt = parse_ist(rec.get('Created At (IST)'))
+              if dt:
+                  known_by_row.setdefault((str(rec.get('Campaign Name', '')).strip(), minute_key(dt)), set()).add(cid)
+
+          print(f'Window: {START:%Y-%m-%d} to {(END - timedelta(days=1)) if END else datetime.now(IST):%Y-%m-%d} IST | '
+                f'already in tab: {len(records)} | refresh existing: {REFRESH_EXISTING} | content: {INCLUDE_CONTENT}', flush=True)
+
+          fetch_failures, id_failures = [], []
+          with sync_playwright() as playwright:
+              browser = playwright.chromium.launch(headless=True)
+              context = browser.new_context(storage_state=session, timezone_id='Asia/Kolkata')
+              list_page = context.new_page()
+              detail_page = context.new_page()
+
+              with json_responses(list_page, limit=800) as list_payloads:
+                  candidates, page_signatures = discover(list_page)
+                  api_index = api_campaign_index(list_payloads)
+                  pending = []
+                  for cand in candidates:
+                      key = (cand['name'].strip(), minute_key(cand['dt']))
+                      ids = api_index.get(key) or known_by_row.get(key) or set()
+                      if len(ids) == 1:
+                          cand['id'] = next(iter(ids))
+                      else:
+                          pending.append(cand)
+                  print(f'{len(candidates)} broadcasts in window; {len(candidates) - len(pending)} IDs matched without clicking, '
+                        f'{len(pending)} to open from the list.', flush=True)
+                  if pending:
+                      resolved, id_failures = resolve_ids_by_click(list_page, pending, page_signatures)
+                      for cand in pending:
+                          if id(cand) in resolved:
+                              cand['id'] = resolved[id(cand)]
+
+              queue, seen = [], set()
+              for cand in candidates:
+                  cid = cand.get('id')
+                  if not cid or cid in seen:
+                      continue
+                  seen.add(cid)
+                  old = records.get(cid, {})
+                  if old and old.get('Data Status') == 'Final' and not REFRESH_EXISTING:
+                      continue
+                  queue.append(cand)
+              print(f'Fetching metrics for {len(queue)} broadcast(s); {len(seen) - len(queue)} already final in the tab.', flush=True)
+
+              since_flush = 0
+              for number_done, cand in enumerate(queue, 1):
+                  cid = cand['id']
+                  details = None
+                  for attempt in (1, 2):
+                      try:
+                          details = fetch_details(detail_page, cid)
+                          break
+                      except Exception as exc:
+                          if attempt == 2:
+                              fetch_failures.append(f"{cand['name']} ({cid}): {exc}")
+                              print(f"WARNING: metrics failed for {cand['name']} ({cid}): {exc}", flush=True)
+                          else:
+                              detail_page.wait_for_timeout(2000)
+                  if details is None:
+                      continue
+                  rec = build_record(cid, cand['name'], cand['dt'], details, records.get(cid, {}))
+                  effective = sort_time(rec)
+                  if effective < START or (END is not None and effective >= END):
+                      print(f"Outside window by send time, skipped: {cand['name']}", flush=True)
+                      continue
+                  records[cid] = rec
+                  since_flush += 1
+                  print(f"[{number_done}/{len(queue)}] {cand['name']} | {rec['Sent At (IST)']} | sent={rec['Sent']} "
+                        f"read={rec['Read']} clicked={rec['Clicked']} cost=INR {rec['Actual Cost (INR)']}", flush=True)
+                  if since_flush >= FLUSH_EVERY:
+                      row_count_on_sheet = write_table(history_ws, records, row_count_on_sheet)
+                      since_flush = 0
+                      print(f'Progress saved to "{TAB_NAME}" ({len(records)} rows).', flush=True)
+
+              browser.close()
+
+          row_count_on_sheet = write_table(history_ws, records, row_count_on_sheet, final=True)
+          print(f'Done: "{TAB_NAME}" now holds {len(records)} broadcasts.', flush=True)
+          if id_failures or fetch_failures:
+              print(f'{len(id_failures)} ID lookup(s) and {len(fetch_failures)} metric fetch(es) failed; '
+                    'everything else was saved. Rerun to retry them.', flush=True)
+              for line in fetch_failures:
+                  print(' - ' + line, flush=True)
+              sys.exit(1)
+          PY
+
+      - name: Upload AiSensy diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: aisensy-backfill-debug-${{ github.run_id }}-${{ github.run_attempt }}
+          path: aisensy-debug/
+          if-no-files-found: ignore
+          retention-days: 7
