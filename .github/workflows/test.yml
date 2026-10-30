@@ -1114,9 +1114,28 @@ jobs:
               raise RuntimeError('Missing AISENSY_SESSION secret')
           if not google_json:
               raise RuntimeError('Missing GOOGLE_SERVICE_ACCOUNT_JSON secret')
-          session = json.loads(session_json)
-          if not isinstance(session, dict) or not isinstance(session.get('cookies', []), list) or not isinstance(session.get('origins', []), list):
-              raise RuntimeError('AISENSY_SESSION must contain Playwright storage-state JSON. Refresh it with the login script.')
+          def decode_session(value):
+              import base64, zlib
+              try:
+                  value = value.strip()
+                  if value.startswith('zlib:'):
+                      packed = base64.b64decode(''.join(value[5:].split()), validate=True)
+                      value = zlib.decompress(packed).decode('utf-8')
+                  state = json.loads(value)
+              except (ValueError, UnicodeError, zlib.error):
+                  raise RuntimeError(
+                      'AISENSY_SESSION is invalid or incomplete. Use the login helper and '
+                      'paste its entire output into AISENSY_SESSION, including the zlib: prefix. '
+                      'Do not put it in GOOGLE_SERVICE_ACCOUNT_JSON. No campaign data was changed.'
+                  ) from None
+              if (not isinstance(state, dict)
+                      or not isinstance(state.get('cookies'), list)
+                      or not isinstance(state.get('origins'), list)):
+                  raise RuntimeError('AISENSY_SESSION is not Playwright browser storage. Regenerate it using the login helper.')
+              return state
+
+          session = decode_session(session_json)
+          print('AiSensy session format decoded successfully.', flush=True)
           # AiSensy redirects between these two origins. Restore missing origin storage
           # before navigation; never overwrite storage already captured for an origin.
           origins = session.setdefault('origins', [])
