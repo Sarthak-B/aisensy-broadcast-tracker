@@ -46,7 +46,7 @@ jobs:
           from datetime import timedelta
           from datetime import datetime, timezone
           from zoneinfo import ZoneInfo
-          from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+          from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError
           import gspread
           import time
           from gspread.http_client import HTTPClient
@@ -480,14 +480,14 @@ jobs:
                           page.goto(LIST_URL, wait_until='domcontentloaded', timeout=30000)
                       except PlaywrightTimeoutError:
                           print(f'Navigation slow on attempt {attempt}; checking page and campaign responses.', flush=True)
-                      # A persisted campaign-name search can hide all current rows.
-                      search = page.locator('input[placeholder*="campaign" i]')
-                      if search.count() == 1 and search.is_visible() and search.input_value():
-                          search.fill('')
-                          print('Cleared saved campaign-name search filter.', flush=True)
                       deadline = time.monotonic() + 40
                       while time.monotonic() < deadline:
                           try:
+                              # Recheck after redirects; DOM access can be interrupted by navigation.
+                              search = page.locator('input[placeholder*="campaign" i]')
+                              if search.count() == 1 and search.is_visible() and search.input_value(timeout=2000):
+                                  search.fill('', timeout=2000)
+                                  print('Cleared saved campaign-name search filter.', flush=True)
                               state = page.evaluate(r"""() => {
                                   const text = (document.body?.innerText || '').trim();
                                   if (/\/(?:login|signup)(?:[/?#]|$)/i.test(location.pathname) ||
@@ -512,6 +512,14 @@ jobs:
                                   return
                           except PlaywrightTimeoutError:
                               pass
+                          except PlaywrightError as exc:
+                              navigation_interrupted = any(message in str(exc) for message in (
+                                  'Execution context was destroyed',
+                                  'Cannot find context with specified id',
+                              ))
+                              if page.is_closed() or not navigation_interrupted:
+                                  raise
+                              # Retry against the new document within the existing deadline.
                           # Allow the app time to refresh an initially rejected access token.
                           # Only fail early when refresh itself is rejected and several APIs
                           # remain unauthorized; successful responses replace earlier failures.
