@@ -890,7 +890,9 @@ jobs:
           fetch_failures, id_failures = [], []
           with sync_playwright() as playwright:
               browser = playwright.chromium.launch(headless=True)
-              context = browser.new_context(storage_state=session, timezone_id='Asia/Kolkata')
+              context = browser.new_context(storage_state=session, timezone_id='Asia/Kolkata',
+                                            user_agent=('Mozilla/5.0 (Broadcast Automation - DO NOT LOG OUT) AppleWebKit/537.36 (KHTML, like Gecko) '
+                                                        f'Chrome/{browser.version} Safari/537.36 BroadcastAutomation/1.0'))
               list_page = context.new_page()
               detail_page = context.new_page()
 
