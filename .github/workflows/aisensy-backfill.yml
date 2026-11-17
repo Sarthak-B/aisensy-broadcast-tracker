@@ -488,13 +488,13 @@ jobs:
                   trigger = label.locator('xpath=following::*[@role="combobox" or @aria-haspopup="listbox"][1]')
                   if trigger.count() == 0:
                       return
-                  trigger.first.click(timeout=5000)
+                  safe_click(trigger.first)
                   options = page.locator('[role="listbox"] [role="option"]')
                   options.first.wait_for(timeout=5000)
                   sizes = [(int(re.sub(r'\D', '', text) or 0), i) for i, text in enumerate(options.all_inner_texts())]
                   best = max(sizes) if sizes else (0, 0)
                   if best[0] > 0:
-                      options.nth(best[1]).click(timeout=5000)
+                      safe_click(options.nth(best[1]))
                       page.wait_for_timeout(1500)
                       print(f'Rows per page set to {best[0]}.', flush=True)
                   else:
@@ -560,16 +560,31 @@ jobs:
               raise RuntimeError('Campaign list did not settle on a new page.')
 
 
+          def safe_click(locator, timeout=5000):
+              """Normal click first; if another element covers the target (e.g. a MUI grid
+              overlay intercepting pointer events), click the target element directly."""
+              try:
+                  locator.click(timeout=timeout)
+                  return
+              except Exception as exc:
+                  print(f'Normal click blocked ({type(exc).__name__}); clicking the element directly.', flush=True)
+              try:
+                  locator.scroll_into_view_if_needed(timeout=3000)
+              except Exception:
+                  pass
+              locator.evaluate('el => el.click()')
+
+
           def next_campaign_page(page):
               locator = page.get_by_role('button', name=re.compile(r'^(?:go to |navigate to )?next(?: page)?$', re.I))
               if locator.count() == 1:
                   if not locator.is_enabled():
                       return False
-                  locator.click(timeout=5000)
+                  safe_click(locator)
                   return True
               icon_button = page.locator('button').filter(has=page.locator('svg[data-testid="KeyboardArrowRightIcon"], svg[data-testid="ChevronRightIcon"]'))
               if icon_button.count() == 1 and icon_button.is_enabled():
-                  icon_button.click(timeout=5000)
+                  safe_click(icon_button)
                   return True
               return False
 
@@ -641,7 +656,7 @@ jobs:
                       if len(match) != 1:
                           raise RuntimeError('row not found uniquely on its list page')
                       row = page.locator(f'[data-bf-row="{match[0]["idx"]}"]')
-                      row.get_by_text(cand['name'], exact=True).first.click(timeout=15000)
+                      safe_click(row.get_by_text(cand['name'], exact=True).first, timeout=15000)
                       page.wait_for_url(re.compile(r'/campaigns/all/view/[A-Za-z0-9]+'), timeout=20000)
                       resolved[id(cand)] = re.search(r'/view/([A-Za-z0-9]+)', page.url).group(1)
                       current = None
