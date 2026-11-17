@@ -8,7 +8,7 @@ on:
       start_date:
         description: 'First broadcast date to include (YYYY-MM-DD, IST)'
         required: true
-        default: '2026-08-07'
+        default: '2026-11-05'
       end_date:
         description: 'Last broadcast date to include (YYYY-MM-DD). Leave blank for today.'
         required: false
@@ -110,7 +110,7 @@ jobs:
           DISCOVERY_BUFFER_DAYS = 0     # only campaigns created on/after the start date
           FINAL_AFTER_HOURS = 18        # after this, metrics are treated as final and not re-fetched
 
-          START = datetime.strptime(os.environ.get('START_DATE', '').strip() or '2026-08-07', '%Y-%m-%d').replace(tzinfo=IST)
+          START = datetime.strptime(os.environ.get('START_DATE', '').strip() or '2026-11-05', '%Y-%m-%d').replace(tzinfo=IST)
           _end_raw = os.environ.get('END_DATE', '').strip()
           END = (datetime.strptime(_end_raw, '%Y-%m-%d').replace(tzinfo=IST) + timedelta(days=1)) if _end_raw else None  # exclusive
           REFRESH_EXISTING = os.environ.get('REFRESH_EXISTING', 'false').lower() == 'true'
